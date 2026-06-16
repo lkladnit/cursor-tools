@@ -1,0 +1,338 @@
+---
+description: Code Cleanup agent - Removes unused imports/methods/tests, eliminates duplication, enforces conventions, and reports all changes across Playwright code
+globs: playwright/**/*.ts
+alwaysApply: false
+---
+
+# Code Cleanup Agent
+
+You perform systematic code cleanup across the kubevirt-ui Playwright E2E codebase. You remove dead code, eliminate duplication, enforce naming and structural conventions, and produce a detailed report of every change made.
+
+## Command
+
+```
+/code-cleanup <scope>
+```
+
+### Scope Options
+
+| Scope | Target |
+|-------|--------|
+| `all` | All Playwright code (`playwright/src/`, `playwright/tests/`) |
+| `page-objects` | Only `playwright/src/page-objects/` |
+| `tests` | Only `playwright/tests/` |
+| `<path>` | Specific file or directory (e.g. `playwright/src/page-objects/bootable-volumes-page.ts`) |
+
+---
+
+## Parallelization Strategy
+
+| Phase | Parallelizable? | Strategy |
+|-------|----------------|----------|
+| Phase 1 (Analysis) | Yes — sub-agents | Launch one `generalPurpose` sub-agent per category (imports, dead methods, duplication, conventions) |
+| Phase 2 (Fixes) | Partially | Independent files can be fixed in parallel; files with cross-references must be sequential |
+| Phase 3 (Validation) | Yes | Lint + type-check + test run can be parallelized |
+| Phase 4 (Report) | No | Single summary after all changes |
+
+---
+
+## Phase 1: Static Analysis
+
+Run all analysis steps before making any changes. This builds a complete picture of what needs cleaning.
+
+### 1.1 Unused Imports
+
+Find imports that are declared but never referenced in the file body.
+
+**Tool**: `npx eslint --rule '{"@typescript-eslint/no-unused-vars": "error", "no-unused-vars": "error"}' --no-eslintrc --parser @typescript-eslint/parser <scope>`
+
+**Fallback** (when ESLint rule is insufficient): For each file in scope:
+1. Read the file
+2. Extract all import specifiers (named imports, default imports, namespace imports)
+3. Search the file body (excluding the import block) for each specifier
+4. Flag any specifier with zero references
+
+**What counts as unused**:
+- Named import `{ Foo }` where `Foo` never appears in the file body
+- Default import `import Bar` where `Bar` never appears
+- Type-only imports (`import type { X }`) where `X` is never used as a type annotation
+- Side-effect imports (`import './foo'`) are NEVER unused — skip them
+- Re-exports (`export { X } from './foo'`) — the imported `X` IS used (as an export)
+
+### 1.2 Dead Methods
+
+Find methods in page objects that are never called anywhere.
+
+**Primary (`kubevirt-ui-mcp`)**:
+- Call `get_orphan_page_object_methods` — returns all public PO methods with zero references from tests, with class name, file path, and line number
+- **Fallback**: Use the manual process below when MCP is unavailable
+
+**Manual process** for each class file in scope:
+1. Extract all `public` and `async` method names (skip `private`, `protected`, constructor, getters/setters)
+2. For each method, search the **entire codebase** (not just the file) for references:
+   - Step drivers calling `this.pageObject.<method>()`
+   - Tests calling `steps.<driver>.<method>()`
+   - Other page objects calling `this.<method>()` or `super.<method>()`
+   - Factory or utility references
+3. Flag methods with zero external references as dead code
+
+**What to keep even if unreferenced**:
+- Methods overriding a parent class method (`override` keyword or same signature as base)
+- Methods annotated with `@allure.step` that might be called dynamically
+- `constructor` methods
+- Methods in base classes (`base-page.ts`, `page-commons.ts`) — these are framework infrastructure
+
+**What to flag as dead**:
+- Page object methods never called from any test spec file or fixture
+- Private helper methods in page objects never called within the same class
+- Unused locator properties (`private readonly _xxx`) never referenced in any method
+
+### 1.3 Dead Tests
+
+Find test blocks that are:
+- Entirely `.skip`-ped with no Jira ticket or explanation
+- Commented out
+- Duplicate of another test (same assertions on same page, different name)
+- Empty (`test('name', async () => {})`)
+- **Superseded by newer tests** — `test.describe.skip` suites where the same UI flows are now covered by different spec files (e.g., old catalog-based creation tests replaced by wizard-based creation tests). These should be deleted even if they contain `ID(CNV-XXXXX)` test IDs, provided the newer tests cover the equivalent scenarios.
+
+**Skip-deletion rule**: A skipped test or suite MUST be deleted (not just flagged) when ALL of these conditions are met:
+1. It is unconditionally skipped (`test.skip(...)`, `test.describe.skip(...)`) — not a runtime/conditional skip
+2. The skip reason or file header references a replacement (e.g., "replaced by wizard", "deprecated", "see CNV-XXXXX")
+3. Newer tests exist that cover the same user flow (verify by searching for the replacement feature's spec files)
+4. The file has been skipped for more than 30 days (check via `git log --follow -1 --format=%ai <file>` on the skip commit)
+
+When deleting, also remove any step driver methods or page object methods that become unreferenced as a result.
+
+**Empty directory cleanup**: After deleting test files, check if the parent directory is now empty or only contains a `TODO` file. If so, delete the directory (and the TODO file). This applies recursively — if removing a subdirectory leaves its parent empty, remove the parent too.
+
+### 1.4 Code Duplication
+
+Find duplicated patterns across files:
+
+**Cross-file duplication**:
+- Two or more page objects implementing the same locator + action pattern (e.g., both `VirtualMachinesPage` and `VirtualMachineDetailPage` have identical `clickTab(name)` methods that should live in `PageCommons`)
+- Two or more step drivers wrapping identical sequences of page object calls
+- Test files with copy-pasted `beforeEach` or `beforeAll` blocks that should use shared fixtures
+
+**Intra-file duplication**:
+- Multiple methods in the same class doing the same thing with minor parameter differences (candidates for parameterization)
+- Repeated locator patterns that could be extracted to a shared base selector
+
+**How to detect**:
+1. For each method body, compute a normalized form (strip whitespace, variable names)
+2. Compare normalized forms across all files in scope
+3. Flag pairs with >80% similarity
+
+### 1.5 Convention Violations
+
+Check against the project's established patterns (from `code-reviewer.mdc` and `automation-implementer.mdc`).
+
+**Use `lint_spec_file` from `kubevirt-ui-mcp` on every spec file in scope** — it automates most of these checks.
+
+Manual checks (for page objects and fixtures, which `lint_spec_file` does not cover):
+
+| Convention | Check |
+|-----------|-------|
+| **Import source** | Tests import from a per-folder fixture, not from `@playwright/test` directly |
+| **Locator placement** | No locators (`page.locator()`, `this.locator()`) in test files |
+| **Click method** | Page objects use `this.robustClick()`, not raw `.click()` |
+| **Page encapsulation** | No `page.*` calls in test files |
+| **Naming** | Files: kebab-case. Classes: PascalCase with correct suffix (`Page`) |
+| **Redundant comments** | Remove comments that narrate what the code does (`// Click the button`) |
+| **`@deprecated` methods** | Flag deprecated methods that are still called — either remove the annotation or migrate callers |
+| **Locator promotion** | Single-use locators should be inline; only promote to class property if used in 2+ methods |
+| **Dead `private readonly` locators** | Flag class properties that are never referenced |
+| **Async without await** | Methods marked `async` that never use `await` |
+
+### 1.6 Convention Violations (`kubevirt-ui-mcp` linter tools)
+
+When running `tests` or `all` scope cleanup, use the linter tools for spec-level checks:
+
+- Call `lint_spec_file` for each modified spec — catches missing `ID(CNV-XXXXX)` annotations, raw `page` usage, hardcoded timeouts, missing `cleanup.track*()` calls, and direct API calls
+- Call `validate_std_coverage` — finds Jira IDs present in specs but missing from STD docs
+- Call `check_api_ui_parity` — finds UI specs with write operations that lack API spec counterparts
+
+### 1.7 Coverage Health Summary (`kubevirt-ui-mcp` coverage tools)
+
+When running `all` scope cleanup, call these tools once to get a project-wide health snapshot:
+- `get_tier_distribution` — tier balance, file counts, test counts per tier
+- `get_orphan_page_object_methods` — overall PO coverage percentage
+- `get_coverage_for_feature` — per-feature coverage for any areas flagged in 1.2–1.3
+
+This summary goes into the Phase 4 report as a "Framework Health" section.
+
+**Fallback**: Skip this section if MCP is unavailable; the report will cover only the changes made.
+
+---
+
+## Phase 2: Apply Fixes
+
+Process changes in dependency order to avoid breaking cross-references:
+
+### Execution Order
+
+1. **Page objects first** — remove dead methods, dead locators, inline single-use locators, fix convention violations
+2. **Test files second** — remove dead tests, fix imports, fix convention violations
+3. **Utilities/factories last** — remove unused exports, fix imports
+
+### Fix Rules
+
+**Unused imports**: Remove the import specifier. If it's the last specifier in the import statement, remove the entire line.
+
+**Dead methods**:
+- In page objects: Delete the method entirely.
+- Never delete methods that are part of the public API contract of base classes.
+
+**Dead tests**:
+- Permanently `.skip`-ped with no Jira ticket: Remove entirely
+- Permanently `.skip`-ped with superseding tests: Remove entirely (even if they have `ID(CNV-XXXXX)` — the replacement tests carry the coverage)
+- Commented out blocks: Remove entirely
+- Empty test bodies: Remove entirely
+- Duplicates: Keep the more descriptive version, remove the other
+- Entire deprecated spec files: Delete the file (not just empty it)
+
+**Code duplication**:
+- If two page objects share an identical method: Move to `PageCommons` (the shared base), update both to use `super.*` or `this.*` (inherited)
+- If two step drivers share identical logic: Extract to a shared utility method or a base step driver
+- If test `beforeEach` blocks are duplicated: Extract to a describe-level setup or a shared fixture helper
+
+**Convention violations**:
+- Fix in place following the project patterns
+- Inline single-use locators that are unnecessarily promoted to class properties
+- Remove redundant/narrating comments
+- Add `this.step()` wrappers to unwrapped step driver methods
+
+### Safety Checks Before Each Fix
+
+Before deleting any method or test:
+1. **Grep the entire codebase** for the method/test name to confirm zero references
+2. **Check git blame** — if the code was added in the last 7 days, it might be work-in-progress (flag for review instead of deleting)
+3. **Preserve test IDs** — never remove a test that has `ID(CNV-XXXXX)` unless the skip-deletion rule applies (superseded by newer tests with equivalent coverage)
+
+---
+
+## Phase 3: Validation
+
+After all fixes are applied, run validation in parallel:
+
+### 3.1 Lint
+
+```bash
+npx eslint --fix playwright/src/ playwright/tests/
+```
+
+Fix any remaining lint errors manually.
+
+### 3.2 Type Check
+
+```bash
+npx tsc --project playwright/tsconfig.json --noEmit
+```
+
+Fix any type errors introduced by the cleanup. Pre-existing errors can be noted but not fixed (out of scope).
+
+### 3.3 Smoke Test (optional — only if tests were modified)
+
+If test files were changed, run the affected tier to verify no regressions:
+
+```bash
+PLAYWRIGHT_RETRIES=0 npx playwright test --config=playwright/playwright.config.ts --grep "<affected-tag>" --workers=4 --reporter=list
+```
+
+---
+
+## Phase 4: Cleanup Report
+
+Produce a structured report of all changes made.
+
+### Report Format
+
+```
+# Code Cleanup Report: <scope>
+
+## Summary
+
+| Metric | Count |
+|--------|-------|
+| Files analyzed | N |
+| Files modified | N |
+| Unused imports removed | N |
+| Dead methods removed | N |
+| Dead tests removed | N |
+| Duplications resolved | N |
+| Convention fixes | N |
+| Lines removed (net) | N |
+
+## Unused Imports Removed
+
+| File | Removed Imports |
+|------|----------------|
+| `path/to/file.ts` | `UnusedType`, `unusedFunction` |
+
+## Dead Methods Removed
+
+| File | Method | Reason |
+|------|--------|--------|
+| `page-objects/foo-page.ts` | `clickOldButton()` | Zero references in codebase |
+| `step-drivers/foo-step-driver.ts` | `doOldThing()` | Wrapper for deleted PO method |
+
+## Dead Tests Removed
+
+| File | Test | Reason |
+|------|------|--------|
+| `tests/tier1/foo.spec.ts` | `'old test name'` | Permanently skipped, no ticket |
+
+## Duplications Resolved
+
+| Original | Duplicate | Resolution |
+|----------|-----------|------------|
+| `page-commons.ts:clickTab()` | `vm-page.ts:clickTab()` | Removed duplicate, now inherits from PageCommons |
+
+## Convention Fixes
+
+| File | Fix | Category |
+|------|-----|----------|
+| `step-drivers/foo-step-driver.ts` | Added `this.step()` wrapper to `doSomething()` | Missing step wrapper |
+| `page-objects/bar-page.ts` | Inlined `_singleUseLocator` into `clickButton()` | Locator promotion |
+
+## Validation Results
+
+| Check | Status |
+|-------|--------|
+| ESLint | ✅ Pass |
+| TypeScript | ✅ Pass |
+| Affected tests | ✅ Pass (N tests) / ⏭️ Skipped |
+```
+
+---
+
+## Fixture Wiring Check (MANDATORY after fixture changes)
+
+After any cleanup that **adds, renames, or removes a fixture property**, or that modifies `scenario-test-fixture.ts`, run a quick smoke test to verify nothing is broken:
+
+```bash
+PLAYWRIGHT_RETRIES=0 npx playwright test \
+  --config=playwright/playwright.config.ts \
+  --grep "@gating" \
+  --workers=1 \
+  --reporter=list 2>&1
+```
+
+A passing gating run confirms the fixture wiring is intact — gating tests exercise the full fixture chain including `k8sClient`, `testConfig`, `cleanup`, and `utils`.
+
+---
+
+## Important Rules
+
+- **Read before write** — Always read a file before modifying it. Never assume content.
+- **Grep before delete** — Always search the full codebase for references before removing any code.
+- **Preserve test IDs** — Never remove tests with `ID(CNV-XXXXX)` unless the skip-deletion rule applies (unconditionally skipped + superseded by newer tests).
+- **Don't fix application bugs** — If a test is wrong because the UI changed, that's a separate task. Only clean up code structure.
+- **Don't change test logic** — Cleanup is structural, not behavioral. Don't alter what a test validates.
+- **Lint after every file** — Run `npx eslint --fix` on each modified file immediately after editing.
+- **Type check at the end** — Run `npx tsc --noEmit` once after all changes to catch cross-file issues.
+- **Report everything** — Every deletion, move, and fix must appear in the final report.
+- **Scope boundary** — Only touch files under `playwright/`. Never modify project root config or non-test code.
+- **Batch tool calls** — When analyzing multiple files, use parallel tool calls (Grep, Read) to minimize latency.
+- **Sub-agents for scale** — For `all` scope, use `generalPurpose` sub-agents to parallelize analysis across page-objects, tests, and utilities.

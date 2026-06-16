@@ -1,0 +1,107 @@
+---
+description: >
+  Mandatory token-saving protocol: use kubevirt-ui-mcp context tools instead of
+  reading or grepping raw TypeScript files under playwright/src/. Reading or grepping
+  any file in page-objects/, clients/, or fixtures/ without first trying the MCP tool
+  is a policy violation.
+alwaysApply: true
+---
+
+# Context Proxy — Token-Efficient Framework Access
+
+The `kubevirt-ui-mcp` server's **context module** provides AST-based compressed views of the
+playwright codebase. **These tools are MANDATORY, not optional.** Reading or grepping
+raw `.ts` files in `playwright/src/` without first trying the MCP tool wastes tokens
+and is a policy violation.
+
+## STOP — Check Before You Act
+
+Before any of these actions on `playwright/src/` files, use `kubevirt-ui-mcp` instead:
+
+| If you are about to… | Use this instead |
+|---|---|
+| `Read` a page object, client, or fixture file | `get_class_surface(class_name)` |
+| `grep` / `Shell rg` for a method name in `playwright/src/` | `search_methods(query)` |
+| `grep` / `Shell rg` for a selector or `data-test` attribute | `get_selector_map(class_name)` |
+| `Read` `scenario-test-fixture.ts` | `get_fixture_api()` |
+| Search for import paths via `grep` or barrel file reads | `get_import_guide(symbols=[...])` |
+| Start writing a new spec/page object from scratch | `get_base_patterns(pattern_type)` |
+| Wonder "does this method exist?" across multiple files | `get_task_context(task)` first |
+
+**Only fall back to direct Read/grep if the MCP tool returns no result or errors.**
+
+## Hard Blocklist — Never Read Directly
+
+Every file in these directories must be accessed via MCP tools, not Read/grep:
+
+- **All of `playwright/src/page-objects/`** → `get_class_surface(ClassName)` or `get_selector_map(ClassName)`
+- **All of `playwright/src/clients/`** → `get_class_surface(ClassName)`
+- **All of `playwright/src/clients/handlers/`** → `get_class_surface(ClassName)`
+- **`playwright/src/fixtures/scenario-test-fixture.ts`** → `get_fixture_api()`
+
+Specifically, these files are 500+ lines each and must never be read directly:
+
+| File | MCP replacement |
+|---|---|
+| `virtual-machines-page.ts` (~4,797 lines) | `get_class_surface("VirtualMachinesPage")` |
+| `virtual-machine-detail-page.ts` (~4,007 lines) | `get_class_surface("VirtualMachineDetailPage")` |
+| `catalog-page.ts` (~3,300 lines) | `get_class_surface("CatalogPage")` |
+| `page-commons.ts` (~1,298 lines) | `get_class_surface("PageCommons")` |
+| `kubernetes-client.ts` (~3,200 lines) | `get_class_surface("KubernetesClient")` |
+| `vm-handler.ts` (~2,200 lines) | `get_class_surface("VirtualMachineHandler")` |
+| `oc-cli-client.ts` (~1,200 lines) | `get_class_surface("OcCliClient")` |
+| `scenario-test-fixture.ts` (~1,200 lines) | `get_fixture_api()` |
+
+## grep / Shell Interception Rules
+
+These shell patterns on `playwright/src/` must be replaced with `kubevirt-ui-mcp` calls:
+
+```
+# WRONG — do not do this:
+grep -rn "methodName" playwright/src/ --include="*.ts"
+rg "methodName" playwright/src/
+
+# RIGHT — do this instead (kubevirt-ui-mcp context tools):
+search_methods("methodName")                    # find method across all classes
+get_class_surface("CatalogPage", "methodName")  # filtered to one class
+```
+
+```
+# WRONG:
+grep -n "data-test\|selector" playwright/src/page-objects/catalog-page.ts
+
+# RIGHT:
+get_selector_map("CatalogPage")
+```
+
+```
+# WRONG:
+grep -n "import.*from\|export" playwright/src/fixtures/scenario-test-fixture.ts
+
+# RIGHT:
+get_fixture_api()
+get_import_guide(symbols=["VirtualMachinesPage", "withAllure"])
+```
+
+## Tool Hierarchy (use in order)
+
+```
+1. get_task_context(task)          ← START HERE for any implementation task
+2. get_class_surface(class_name)   ← when you know the class to examine
+3. search_methods(query)           ← keyword search across all classes
+4. get_selector_map(class_name)    ← CSS/data-test selectors for a page object
+5. get_base_patterns(type)         ← code skeleton for new components
+6. Read file directly              ← LAST RESORT: only if MCP errors or returns nothing
+```
+
+## Quick Decision Matrix
+
+| Question | MCP call |
+|---|---|
+| "Does `VirtualMachinesPage` have a method for X?" | `get_class_surface("VirtualMachinesPage", "X")` |
+| "What methods exist for environment/disk?" | `search_methods("environment disk")` |
+| "What selector does the template card use?" | `get_selector_map("CatalogPage")` |
+| "What's the correct import for `withAllure`?" | `get_import_guide(["withAllure"])` |
+| "What fixture properties are available in the base fixture?" | `get_fixture_api()` |
+| "How do I write a new tier1 test?" | `get_base_patterns("test-creation", "my-feature")` |
+| "What context do I need for a mock-based test?" | `get_task_context("mock route intercept catalog")` |

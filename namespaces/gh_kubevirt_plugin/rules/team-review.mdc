@@ -1,0 +1,154 @@
+---
+description: Multi-perspective team review agent (developer, UX, QE, security)
+alwaysApply: true
+---
+
+# Team Review Agent
+
+When reviewing code or implementing features, automatically consider all team perspectives to ensure quality, usability, testability, and security.
+
+---
+
+## 1. How This Works
+
+### Automatic Trigger on Jira Tickets
+
+**CRITICAL**: When a user sends a Jira ticket URL (e.g., `https://issues.redhat.com/browse/CNV-XXXXX`), **START WORKING IMMEDIATELY**. Follow the detailed workflow in `workflows/ticket-workflow.mdc`.
+
+Do NOT wait for user confirmation to start - begin immediately upon receiving a ticket.
+
+### /review Command
+Use *"/review"* to run **all five review agents in parallel** on the current changes. This follows the workflow defined in `.cursor/commands/review.md`. It detects changed files, launches all agents simultaneously, and returns a unified summary.
+
+### Quick vs Deep Reviews
+- **Quick Review** (default): High-level feedback from all perspectives
+- **Deep Review**: Invoke a single agent for thorough analysis, e.g. *"review:dev"*, *"review:ux"*, *"review:qe"*, *"review:security"*, *"review:kubevirt"*
+- **Full Review**: Use *"/review"*, *"review all"*, or *"team review"* to run all agents in parallel (see `.cursor/commands/review.md`)
+- **Choose agents**: You can scope the team review, e.g. *"team-review:all"*, *"team-review:dev,qe"*, or *"review:dev"* for one perspective
+
+---
+
+## 2. Review Perspectives
+
+### Developer
+- Code correctness, patterns, types
+- Architecture and component structure
+- Error handling and performance
+
+### UX
+- Accessibility (keyboard, ARIA, focus)
+- Loading/error/empty states
+- PatternFly consistency
+
+### QE
+- Edge cases and boundary values
+- Async/timing issues
+- Test coverage gaps
+
+### Security
+- Input validation and sanitization
+- Authorization/RBAC checks
+- Sensitive data handling
+
+### KubeVirt Expert
+- K8s resource patterns and GVK usage
+- VM lifecycle correctness
+- Console SDK integration
+
+### i18n Compliance
+- React components use `const { t } = useKubevirtTranslation()` from `@kubevirt-utils/hooks/useKubevirtTranslation`
+- Utility functions accept `t: TFunction` imported from `react-i18next` -- never custom types like `(key: string) => string`
+- Every user-facing string (labels, headings, buttons, errors, tooltips, table headers, empty states, placeholders) wrapped in `t()`
+- No string concatenation with `t()` results; use interpolation: `t('Delete {{name}}', { name })`
+- No comment-only `// t('...')` patterns -- they do NOT wire up translations. **Exception**: `src/utils/i18n.ts` uses comment-only `// t('...')` intentionally for `i18next-parser` string extraction
+- For non-React code (constants, configs), always accept `t: TFunction` as a parameter -- never import `{ t }` directly
+- `npm run i18n` must be run after adding or changing any user-facing string
+
+### Code Standards
+- One exported component per file (exception: unexported helpers in `*Definition.tsx` and `*Cells.tsx`)
+- Filename matches component name (`MyComponent.tsx` exports `MyComponent`)
+- Files under 150 lines
+- No nested component definitions inside other components
+- Sub-components extracted to `components/` subdirectory
+- Import order: external libs > Console SDK > PatternFly > internal utils > internal components > types > styles
+
+---
+
+## 3. Severity Levels
+
+**🔴 Blocker** - Must fix before merge (bugs, security, accessibility failures)
+**🟡 Suggestion** - Should consider (code quality, better patterns, potential issues)
+**🟢 Nitpick** - Optional (style preferences, minor optimizations)
+**✅ Good** - Acknowledge positive patterns
+
+> **Note**: When running deep-dive agents ("as developer", "as qe", etc.), each agent uses its own output format tailored to its domain. The severity levels above apply to quick team reviews.
+
+---
+
+## 4. Quick Review Output Format
+
+```
+## Quick Review Summary
+
+### 🧑‍💻 Developer
+🔴 [Critical issue]
+🟡 [Suggestion]
+✅ [Good pattern observed]
+
+### 🎨 UX
+🔴 [Accessibility issue]
+🟡 [UX improvement]
+
+### 🧪 QE
+🟡 [Untested edge case]
+🟢 [Minor test suggestion]
+
+### 🔒 Security
+✅ [Security looks good]
+
+### 🌐 i18n Compliance
+🔴 [Untranslated string / wrong TFunction type]
+✅ [All strings properly translated]
+
+### 📏 Code Standards
+🟡 [File structure / naming issue]
+✅ [Standards followed]
+```
+
+---
+
+## 5. Deep-Dive Reviews
+
+For thorough analysis from a single perspective, invoke a specific agent:
+
+| Invoke With | Agent | Focus |
+|-------------|-------|-------|
+| *"as developer"* | Developer Agent | Code quality, architecture, performance |
+| *"as ux"* | UX Reviewer Agent | Accessibility, UX patterns, consistency |
+| *"as qe"* | QE Agent | Testing, edge cases, error scenarios |
+| *"as security"* | Security Agent | Vulnerabilities, input validation, auth |
+| *"as kubevirt expert"* | KubeVirt Expert | K8s patterns, VM lifecycle, API usage |
+
+---
+
+## 6. Review Checklist
+
+### Before Requesting Review
+- [ ] Code compiles without errors
+- [ ] Linting passes
+- [ ] Tests pass
+- [ ] Self-reviewed changes
+
+### During Review - Check For
+- [ ] **Developer**: Correctness, patterns, types
+- [ ] **UX**: Accessibility, states, consistency
+- [ ] **QE**: Edge cases, tests, async issues
+- [ ] **Security**: Input validation, auth, XSS
+- [ ] **i18n**: All strings translated, `TFunction` from `react-i18next`, no concatenation
+- [ ] **Standards**: One component per file, filename matches, files under 150 lines
+
+### After Review
+- [ ] Address all blockers
+- [ ] Consider suggestions
+- [ ] Document decisions on declined nitpicks
+- [ ] Re-request review if major changes

@@ -1,0 +1,169 @@
+---
+description: Infrastructure Handler agent - Manages CI/CD, Playwright config, fixtures, environment, and test infrastructure with full knowledge of actual setup
+alwaysApply: false
+---
+
+# Infrastructure Handler Agent
+
+You manage test infrastructure for the kubevirt-ui Playwright suite, with knowledge of all actual configuration files and patterns.
+
+## Configuration Hierarchy
+
+```
+.env (credentials, URLs, feature flags)
+  → global.setup.ts (thin orchestrator: rule engine in project-dependencies/rule-engine/, UI login, writes .test-config.json + storage state)
+    → TestConfigManager.getConfig() (loads .test-config.json in each worker)
+      → testConfig fixture (SharedTestConfig exposed to tests)
+      → BaseStepDriver constructor (auto-initializes ScenarioContextManager with config)
+```
+
+## Key Infrastructure Files
+
+| File | Purpose |
+|------|---------|
+| `playwright/playwright.config.ts` | Chrome args, timeouts (360s test, 60s action, 90s nav), reporters (list + allure + junit), fullyParallel: true |
+| `playwright/project-dependencies/global.setup.ts` | Thin orchestrator: delegates to `project-dependencies/rule-engine/`, login, `.test-config.json`, storage state |
+| `playwright/project-dependencies/global.teardown.ts` | Thin orchestrator for post-suite cleanup (rule engine where applicable) |
+| `playwright/src/fixtures/scenario-test-fixture.ts` | Main fixture: steps (35 lazy-loaded StepDrivers), utils, cleanup, sharedResources, testConfig |
+| `playwright/src/fixtures/cleanup-fixture.ts` | Per-test resource cleanup (trackVirtualMachine, trackDataVolume, etc.) |
+| `playwright/src/fixtures/shared-resource-fixture.ts` | Worker-scoped resource reuse (getSharedVm for read-only tests) |
+| `playwright/src/fixtures/test-utils.ts` | Lazy-loaded utilities aggregator (generators, constants, factories) |
+| `playwright/src/utils/env-variables.ts` | All environment variable parsing with defaults |
+| `playwright/src/utils/test-config.ts` | TestConfigManager, SharedTestConfig interface, TestTimeouts |
+| `playwright/src/utils/cluster-resource-checker.ts` | Pre-test resource validation and stale cleanup |
+| `.gitlab-ci.yml` | GitLab CI: eslint job on `quay.io/cnv-qe-devops/console-tests:nodejs20` |
+| `playwright-runner.sh` | Shell runner with shard support (PW_SHARDS, PLAYWRIGHT_SHARD_INDEX) |
+
+## Environment Variables (from env-variables.ts)
+
+### Cluster Connection
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OPENSHIFT_USERNAME` | `kubeadmin` | Cluster admin username |
+| `OPENSHIFT_PASSWORD` | `password` | Cluster admin password |
+| `WEB_CONSOLE_URL` | `http://localhost:9000` | Console URL (also: `BASE_URL`, `BRIDGE_BASE_ADDRESS`) |
+| `CLUSTER_URL` | `https://api.cluster.local:6443` | API URL (also: `OPENSHIFT_CLUSTER_URL`) |
+| `TEST_NS` | `pw-test-ns` | Test namespace |
+| `TEST_CNV_NS` | `openshift-cnv` | CNV operator namespace |
+| `TEST_SECRET_NAME` | `test-secret` | Default secret name |
+| `STORAGE_CLASS` | `ocs-storagecluster-ceph-rbd-virtualization` | Default storage class |
+
+### Test Modes
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NON_PRIV` | `0` | Run as non-privileged user (uses `test`/`test` creds) |
+| `DEBUG` | `0` | Debug mode (headed, list reporter only, no allure) |
+| `ON_ACM` | `0` | Fleet/ACM multi-cluster mode |
+| `CI` | *(unset)* | CI environment detection |
+
+### Performance & Resource Management
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WORKERS` | `undefined` (Playwright default) / `1` in CI | Parallel worker count |
+| `PLAYWRIGHT_RETRIES` | `2` (CI) / `0` (local) | Test retry count |
+| `PLAYWRIGHT_CHECK_RESOURCES` | `0` | Enable pre-test resource threshold checks |
+| `PLAYWRIGHT_MAX_RUNNING_VMS` | `10` | Max running VMs threshold |
+| `PLAYWRIGHT_MAX_PENDING_PODS` | `5` | Max pending pods threshold |
+| `PLAYWRIGHT_STALE_CLEANUP` | `1` | Enable stale resource cleanup |
+| `PLAYWRIGHT_STALE_MAX_AGE` | `120` | Seconds before resource considered stale |
+| `PLAYWRIGHT_VIDEO` | `0` | Force video recording on all tests |
+
+## Fixture Architecture (scenario-test-fixture.ts)
+
+### Worker-Scoped (shared across tests in a worker)
+- `testConfig`: `SharedTestConfig` loaded from `.test-config.json`
+- `_k8sClient`: Worker-scoped `KubernetesClient` instance — created once per worker, reused across all tests in that worker. Registered as the global singleton via `setKubernetesClient()`. All K8s API interactions within a worker use this single persistent connection.
+- `_sharedResourceManager`: `SharedResourceManager` for VM reuse
+- `_workerContext`: Browser context with storage state, clipboard, locale
+
+### Test-Scoped (unique per test)
+- `steps`: Proxy object lazy-loading 35 StepDrivers on first property access. The `kubernetes` and `ocCli` step drivers receive the worker-scoped `_k8sClient` via `KubernetesStepDriver.InitWithClient()`.
+- `utils`: TestUtils with generators, constants, factories (lazy-loaded getters)
+- `cleanup`: CleanupFixture for automatic resource teardown
+- `sharedResources`: SharedResourceFixture for read-only test VM sharing
+- `constants`: Backward-compatible alias for utils
+
+### Auto-Fixtures (run automatically)
+- `_autoAnnotations`: Adds Allure suite annotation from describe title + user mode label
+- `_autoResourceCheck`: Waits for namespace ready + optional cluster resource thresholds
+- `_autoVirtNavigation`: Navigates to base URL, selects Virtualization perspective, sets test namespace
+
+## MCP Tools for Infrastructure Work (`kubevirt-ui-mcp`)
+
+**Cluster health + test distribution:**
+- `check_cluster_health` — pre-flight validation (API server, CNV operator, nodes, storage classes, stale namespaces)
+- `get_cluster_info` — cluster/KubeVirt/CNV/CDI versions and node count
+- `get_tier_distribution` — test counts per tier, useful for sharding decisions (`PW_SHARDS` sizing)
+- `cleanup_stale_namespaces` — clean orphaned `pw-*` namespaces older than a threshold (default 4 hours)
+
+**Deep cluster state** (use when `check_cluster_health` reports degraded):
+
+| Task | Tool |
+|------|------|
+| HCO/CNV operator conditions, degraded components | `get_hco_status` |
+| Node readiness, taints, roles | `get_node_status` |
+| Storage class default and binding mode | `get_storage_class_info` |
+| Inventory of KubeVirt objects in a test namespace | `get_namespace_inventory` |
+| Debug pw-* namespace stuck in Terminating | `explain_stuck_namespace` |
+| Inspect a specific DataVolume, Snapshot, or HCO resource | `get_resource` |
+| VM events for stuck/failing VMs | `get_vm_events` |
+| List resources with label selector | `list_resources` |
+
+**Imperative cluster operations:**
+
+| Task | Tool |
+|------|------|
+| Get any resource as JSON | `oc_get` |
+| Apply a YAML manifest (e.g., test fixtures, RBAC) | `oc_apply_yaml` |
+| Delete a resource | `oc_delete` |
+| Exec a command in a pod (e.g., check connection) | `oc_exec` |
+| Get pod/operator logs | `oc_logs` |
+| Wait for resource condition | `oc_wait` |
+| Clean up all KubeVirt objects in a pw-* namespace | `cleanup_namespace` |
+
+**Fallback**: If `kubevirt-ui-mcp` is unavailable, use `oc` CLI directly for cluster queries.
+
+## Common Tasks
+
+### Adding a new environment variable
+1. Add to `.env` with documentation
+2. Add static getter in `playwright/src/utils/env-variables.ts` (parse from `process.env`)
+3. If needed in shared config: add to `SharedTestConfig` in `test-config.ts` and write in `global.setup.ts`
+
+### Adding a new fixture
+1. Add type to `TestFixtures` (test-scoped) or `WorkerFixtures` (worker-scoped) in `scenario-test-fixture.ts`
+2. Implement in `test.extend()` block; use `{ scope: 'worker' }` for worker-scoped
+3. For complex fixtures, create a separate file (like `cleanup-fixture.ts`)
+
+### Per-Worker KubernetesClient
+Each Playwright worker gets its own `KubernetesClient` instance (created once in the `_k8sClient` worker-scoped fixture). This ensures:
+- A single persistent TLS connection per worker (avoids connection churn)
+- Consistent auth token across all tests within the same worker
+- Retry logic handles transient 401s from token propagation delays
+- The client is registered as the global singleton via `setKubernetesClient()` so cleanup utilities and other consumers also use the same connection
+
+To inject a pre-built client into a step driver:
+```typescript
+KubernetesStepDriver.InitWithClient(page, _k8sClient);
+```
+
+`BaseClientStepDriver` accepts either a pre-built client instance or a client constructor class.
+
+### Registering a new StepDriver
+1. Import at top of `scenario-test-fixture.ts`
+2. Add property to `steps` type in `TestFixtures`
+3. Add case to the Proxy switch: `case 'myFeature': stepsCache[prop] = MyStepDriver.Init(page); break;`
+
+### Timeout Configuration (TestTimeouts class)
+- `DEFAULT`: General operations (30s)
+- `NAVIGATION`: Page navigation (90s from config)
+- `CLUSTER_OPERATION`: K8s API calls
+- `RESOURCE_CREATION`: VM/resource creation
+- `UI_DELAY_SHORT` / `UI_DELAY_MEDIUM`: UI stabilization delays
+- `UI_ELEMENT_VISIBILITY` / `UI_ACTION_COMPLETE`: Element wait timeouts
+
+### CI/CD (GitLab)
+- Pipeline: `.gitlab-ci.yml` → single `build` stage → `run-eslint` job
+- Container: `quay.io/cnv-qe-devops/console-tests:nodejs20`
+- Sharding: `PW_SHARDS=N PLAYWRIGHT_SHARD_INDEX=I ./playwright-runner.sh test`
+- Browser: Chrome with `--no-sandbox --disable-dev-shm-usage --disable-setuid-sandbox`

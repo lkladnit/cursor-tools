@@ -1,0 +1,416 @@
+---
+description: Internationalization (i18n) patterns
+globs: "locales/**,**/i18n*,**/*Translation*"
+alwaysApply: false
+---
+
+# i18n Guidelines
+
+Internationalization patterns and requirements for this project.
+
+---
+
+## 1. Overview
+
+### Translation System
+- Uses `react-i18next` for runtime translations
+- `i18next-parser` for extracting strings
+- Plugin namespace: `plugin__kubevirt-plugin`
+- Source language: English (en)
+
+### Translation Files
+- Location: `locales/{lang}/plugin__kubevirt-plugin.json`
+- Supported languages: en, es, fr, ja, ko, zh
+- English is the source; others are translations
+
+---
+
+## 2. Using Translations
+
+### Translation Hook
+```tsx
+import { useKubevirtTranslation } from '@kubevirt-utils/hooks/useKubevirtTranslation';
+
+const MyComponent: FC = () => {
+  const { t } = useKubevirtTranslation();
+
+  return (
+    <div>
+      <h1>{t('Virtual Machines')}</h1>
+      <p>{t('Manage your virtual machines')}</p>
+    </div>
+  );
+};
+```
+
+### Important
+- Always import from `@kubevirt-utils/hooks/useKubevirtTranslation`
+- Never hardcode user-facing strings
+- The `t` function returns the translated string
+
+---
+
+## 2.5. Passing `t` to Utility Functions
+
+### In React Components
+Always use the hook:
+```tsx
+const { t } = useKubevirtTranslation();
+```
+
+### In Non-React Utility Functions
+Accept `t` as a parameter typed with `TFunction` from `react-i18next`:
+```tsx
+import { TFunction } from 'i18next';
+
+export const getColumns = (t: TFunction) => [
+  { label: t('Name'), key: 'name' },
+  { label: t('Status'), key: 'status' },
+];
+```
+
+### For Constants and Config Files
+Always accept `t` as a parameter -- never import `{ t }` directly:
+```tsx
+import { TFunction } from 'i18next';
+
+// CORRECT - t is passed in, caller provides it from the hook
+export const getPageTitle = (t: TFunction) => t('Virtual Machines');
+
+export const getStatusLabels = (t: TFunction) => ({
+  running: t('Running'),
+  stopped: t('Stopped'),
+});
+```
+
+### CRITICAL: Never Import `{ t }` Directly
+```tsx
+// WRONG - importing t directly bypasses the hook lifecycle
+import { t } from '@kubevirt-utils/hooks/useKubevirtTranslation';
+export const PAGE_TITLE = t('Virtual Machines');
+
+// WRONG - custom function type
+const getLabel = (t: (key: string) => string) => t('Name');
+
+// CORRECT - accept t: TFunction as a parameter
+import { TFunction } from 'i18next';
+export const getLabel = (t: TFunction) => t('Name');
+```
+
+Always import `TFunction` from `react-i18next`. Never import `{ t }` directly from `useKubevirtTranslation`. Never create inline function types like `(key: string) => string` or `(value: string, options?: any) => string` as a substitute.
+
+---
+
+## 3. String Patterns
+
+### Simple Strings
+```tsx
+// Basic translation
+{t('Virtual Machines')}
+{t('Create VM')}
+{t('Delete')}
+```
+
+### Dynamic Values (Interpolation)
+```tsx
+// Single value
+{t('Hello, {{name}}', { name: userName })}
+
+// Multiple values
+{t('{{count}} of {{total}} VMs running', { count: running, total: total })}
+
+// With formatting
+{t('Created on {{date, datetime}}', { date: createdDate })}
+```
+
+### Pluralization
+```tsx
+// Automatic plural handling
+{t('{{count}} item', { count: itemCount })}
+// Requires entries in translation file:
+// "{{count}} item": "{{count}} item"
+// "{{count}} item_plural": "{{count}} items"
+
+// Or explicit
+{t('{{count}} virtual machine', { count: vmCount })}
+// "{{count}} virtual machine_plural": "{{count}} virtual machines"
+```
+
+### Nested Keys
+```tsx
+// For organization (use sparingly)
+{t('vm.status.running')}
+{t('vm.actions.delete')}
+```
+
+---
+
+## 4. Console Extensions
+
+### Extension Label Format
+For labels in plugin extension files, use the special format:
+
+```json
+{
+  "type": "console.navigation/href",
+  "properties": {
+    "name": "%plugin__kubevirt-plugin~Virtual Machines%",
+    "href": "/virtualization/vms"
+  }
+}
+```
+
+### Register in i18n
+Add a comment in `src/utils/i18n.ts` for the parser. This is the **only** file where comment-only `// t('...')` patterns are valid -- they tell `i18next-parser` to extract strings that are referenced dynamically elsewhere and cannot be discovered by static analysis:
+
+```typescript
+// Console extension strings - these are used in plugin-extensions.ts
+// t('plugin__kubevirt-plugin~Virtual Machines')
+// t('plugin__kubevirt-plugin~Templates')
+// t('plugin__kubevirt-plugin~Catalog')
+```
+
+**Note**: This comment-only pattern is exclusively for `src/utils/i18n.ts`. In all other files, `t()` must be a real, executed call (see Section 12).
+
+---
+
+## 5. What to Translate
+
+### Always Translate
+- Page titles and headings
+- Button labels
+- Form labels and placeholders
+- Error messages
+- Success messages
+- Tooltip text
+- Help text
+- Table headers
+- Empty state messages
+- Loading messages
+- Confirmation dialogs
+- Menu items
+- Tab labels
+
+### Never Translate
+- Proper nouns (Kubernetes, KubeVirt, OpenShift, PatternFly)
+- Technical identifiers (VM names, namespaces, resource names)
+- API field names
+- Code values and enums
+- URLs and paths
+- Log messages (internal)
+
+### Be Careful With
+- Mixed technical/user content
+- Formatted values (dates, numbers - use interpolation)
+- Dynamic content from API
+
+---
+
+## 6. Best Practices
+
+### String Quality
+- Use complete sentences when possible
+- Avoid string concatenation
+- Keep context in single string
+- Use interpolation for dynamic parts
+
+### Bad Patterns
+```tsx
+// ❌ Concatenation breaks translation
+{t('Delete') + ' ' + vmName}
+
+// ❌ Split strings lose context
+{t('Click')} {t('here')} {t('to continue')}
+
+// ❌ Hardcoded strings
+<Button>Delete</Button>
+```
+
+### Good Patterns
+```tsx
+// ✅ Single string with interpolation
+{t('Delete {{name}}', { name: vmName })}
+
+// ✅ Complete sentence
+{t('Click here to continue')}
+
+// ✅ Translated button
+<Button>{t('Delete')}</Button>
+```
+
+### Context for Translators
+```tsx
+// Add context when meaning is ambiguous
+// "Delete" could be verb or adjective
+{t('Delete', { context: 'button' })}  // Button action
+{t('Delete', { context: 'status' })}  // Status indicator
+```
+
+---
+
+## 7. Updating Translations
+
+### After Adding Strings
+```bash
+# Extract new strings to translation files
+npm run i18n
+```
+
+### What This Does
+1. Scans source files for `t()` calls
+2. Extracts strings to `locales/en/plugin__kubevirt-plugin.json`
+3. Syncs with other language files (adds missing keys)
+
+### Commit Translation Changes
+- Always commit translation file updates
+- Run `npm run i18n` before PR
+- lint-staged runs this automatically for src changes
+
+---
+
+## 8. Translation File Structure
+
+### File Format
+```json
+{
+  "Virtual Machines": "Virtual Machines",
+  "Create VM": "Create VM",
+  "{{count}} item": "{{count}} item",
+  "{{count}} item_plural": "{{count}} items",
+  "Hello, {{name}}": "Hello, {{name}}",
+  "vm.status.running": "Running"
+}
+```
+
+### Key = Value for English
+- English file has key equal to value
+- Translators provide translations for other languages
+- Keys should be the English text (not identifiers)
+
+---
+
+## 9. Testing Translations
+
+### Verify All Strings Translated
+```bash
+# Check for missing translations
+npm run i18n
+
+# Look for changes in translation files
+git diff locales/
+```
+
+### Manual Verification
+- Switch browser language
+- Check all visible text is translated
+- Verify interpolation works
+- Check pluralization
+
+### Dummy Locale
+```bash
+# Generate dummy locale for testing
+npm run i18n-dummy-locale
+```
+
+---
+
+## 10. Troubleshooting
+
+### String Not Translating
+- Check import is from `useKubevirtTranslation`
+- Verify string is in translation file
+- Run `npm run i18n` to extract
+- Check for typos in key
+
+### Interpolation Not Working
+- Check variable name matches: `{{name}}` and `{ name }`
+- Ensure value is passed to t function
+- Check for typos in variable name
+
+### Missing in Other Languages
+- English file is source of truth
+- Run `npm run i18n` to sync keys
+- Contact translation team for actual translations
+
+---
+
+## 11. Utilities
+
+### Translation Scripts
+```bash
+# Update translation files
+npm run i18n
+
+# Verbose output
+npm run i18n:verbose
+
+# Convert to PO format (for translators)
+npm run i18n-to-po
+
+# Convert from PO format
+npm run po-to-i18n
+
+# Export PO files
+npm run export-pos
+
+# Memsource integration
+npm run memsource-upload
+npm run memsource-download
+```
+
+---
+
+## 12. AI Agent Translation Rules
+
+These rules are mandatory for AI agents when generating or reviewing code:
+
+### When Generating Code
+- Wrap **every** user-facing string in `t()` -- labels, headings, buttons, errors, tooltips, table headers, empty states, placeholders, help text
+- In React components, always use `const { t } = useKubevirtTranslation()`
+- In utility functions and constants, accept `t: TFunction` from `react-i18next` as a parameter
+- **Never** import `{ t }` directly from `useKubevirtTranslation` -- always pass `t` as a parameter
+- Never invent custom types for the translation function
+- Use interpolation for dynamic values: `t('{{count}} items', { count })` -- never concatenate
+- After adding or changing any user-facing string, run `npm run i18n`
+
+### When Reviewing Code
+- Verify every user-facing string is wrapped in `t()`
+- Verify `TFunction` is imported from `react-i18next`, not defined inline
+- Flag any string concatenation with `t()` results as a **blocker**
+- Flag any `// t('...')` comment-only patterns as a **blocker** -- these do not wire up translations. **Exception**: `src/utils/i18n.ts` uses comment-only `// t('...')` intentionally for `i18next-parser` string extraction (see Section 4)
+- Flag any hardcoded user-facing strings (JSX text content, button labels, etc.) as a **blocker**
+- Verify locale diffs are present in the PR when user-facing strings change
+
+### Common Mistakes to Catch
+```tsx
+// BLOCKER: comment-only pattern does NOT translate (except in src/utils/i18n.ts for parser extraction)
+// t('Error')
+// t('Warning')
+
+// BLOCKER: concatenation breaks translation context
+{t('Delete') + ' ' + vmName}
+
+// BLOCKER: hardcoded string
+<Button>Delete</Button>
+
+// BLOCKER: custom type instead of TFunction
+const getLabel = (t: (key: string) => string) => t('Name');
+
+// BLOCKER: template literal with t()
+`${t('Make persistent disk')} - (${names.join(', ')})`
+```
+
+---
+
+## 13. Checklist
+
+- [ ] All user-facing strings use `t()` function
+- [ ] Using `useKubevirtTranslation` hook (or `TFunction` for utility functions)
+- [ ] `TFunction` imported from `react-i18next` (no custom types)
+- [ ] Dynamic values use interpolation `{{variable}}`
+- [ ] No string concatenation for translated text
+- [ ] No comment-only `// t('...')` patterns
+- [ ] Console extensions use `%plugin__...%` format
+- [ ] Extension strings registered in `utils/i18n.ts`
+- [ ] `npm run i18n` run before commit
+- [ ] Translation file changes committed

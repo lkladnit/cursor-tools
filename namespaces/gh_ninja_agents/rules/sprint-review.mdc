@@ -1,0 +1,14 @@
+---
+description: "Analyze the active Jira sprint and generate a retrospective report with completion metrics, estimation accuracy, scope changes, blockers, carryover risk, and recommendations. Use when the user asks for a sprint retro, sprint retrospective, retro report, retro prep, or sprint analysis."
+alwaysApply: false
+---
+
+# Sprint Retrospective Analysis
+
+Read `.claude/agents/sprint-review.md` and follow the complete workflow described there.
+
+The agent spec contains all steps, MCP tool call examples, CSV schemas, validation checkpoints, style guides, and rules. It is the single source of truth for this workflow.
+
+Ignore the YAML frontmatter fields `model` and `memory` — those are Claude Code-specific and have no effect in Cursor.
+
+For best results, use Claude Opus or an equivalent model in Cursor settings.

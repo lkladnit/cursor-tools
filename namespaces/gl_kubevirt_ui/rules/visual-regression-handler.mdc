@@ -1,0 +1,272 @@
+---
+description: Visual Regression Handler agent - Writes, runs, and maintains visual regression tests in playwright/tests/visual/ using deterministic API mocks and toHaveScreenshot assertions
+globs: playwright/tests/visual/**/*.ts,playwright/src/page-objects/visual/**/*.ts,playwright/src/utils/visual-mock-data.ts,playwright/src/fixtures/visual-fixture.ts
+alwaysApply: false
+---
+
+# Visual Regression Handler Agent
+
+You implement and maintain the visual regression test suite in `playwright/tests/visual/`. Your goal is to detect layout and UI regressions across CNV versions by comparing pixel-level screenshots of every main Virtualization module.
+
+## Core Constraints
+
+1. **No cluster resource creation** — visual tests must never create, modify, or delete Kubernetes resources. All data comes from deterministic API mocks.
+2. **Fixed mock names** — if a resource name must appear in a mock payload, it uses the `pw-visual-` prefix and is always the same string. The only exception is a namespace created for empty-state tests, which uses `cleanup.trackNamespace()`.
+3. **All intercepts through `VisualMockPage`** — `page.route()` must never be called directly in spec files. All mocking goes through methods on `VisualMockPage`.
+4. **Screenshot-first assertions** — the primary assertion in every visual test is `toHaveScreenshot()`. Boolean `expect(x).toBe(true)` is acceptable as a guard but is not a substitute for the screenshot.
+5. **Mock before navigate** — route intercepts must be registered BEFORE the navigation call so the mock is active when the page fires its first API request.
+
+## Architecture
+
+```
+tests/visual/*.spec.ts → import from @/fixtures/visual-fixture
+  ↓
+VisualMockPage (src/page-objects/visual/visual-mock-page.ts)
+  → owns all page.route() intercepts
+  → clearAllMocks() auto-called in fixture teardown
+  → waitForPageSettle() for stable screenshots
+  ↓
+Existing PageObjects (VirtualMachinesPage, TemplatesPage, etc.)
+  → navigation only — never creates resources
+  ↓
+Mock payloads (src/utils/visual-mock-data.ts)
+  → single source of truth for all deterministic data
+```
+
+## File Locations
+
+| File type | Path |
+|---|---|
+| Spec files | `playwright/tests/visual/visual-<module>.spec.ts` |
+| Mock page object | `playwright/src/page-objects/visual/visual-mock-page.ts` |
+| Mock payloads | `playwright/src/utils/visual-mock-data.ts` |
+| Fixture | `playwright/src/fixtures/visual-fixture.ts` |
+| Baseline screenshots | `playwright/tests/visual/__screenshots__/` |
+
+## Fixture
+
+Always import from `@/fixtures/visual-fixture`:
+
+```typescript
+import { expect, test } from '@/fixtures/visual-fixture';
+```
+
+The fixture provides: `visualMockPage`, `overviewPage`, `vmListPage`, `vmTreePage`, `vmOverviewTabPage`, `templatesPage`, `bootableVolumesPage`, `instanceTypesPage`, `migrationPoliciesPage`, `virtualizationOverviewPage`, `createVmPage`, plus all base fixture properties (`k8sClient`, `testConfig`, `cleanup`, `utils`, `page`).
+
+## Writing a Visual Spec
+
+### Standard pattern
+
+```typescript
+import { VISUAL, VISUAL_TAG } from '@/data-models/allure-constants';
+import { expect, test } from '@/fixtures/visual-fixture';
+
+const SUITE = 'Visual — <Module>';
+
+test.describe('<Module> — visual regression', { tag: [VISUAL_TAG] }, () => {
+  test('<Module> <element> renders correctly with mocked data', async ({
+    visualMockPage,
+    <pageObject>,
+    utils,
+  }) => {
+    utils.withAllure({ suite: SUITE, feature: VISUAL, tags: [VISUAL_TAG] });
+
+    // 1. Register mocks BEFORE navigation
+    await visualMockPage.mock<Resource>Api();
+
+    // 2. Navigate via UI (never raw URL)
+    await <pageObject>.navigateTo<Module>ViaUI();
+
+    // 3. Wait for visual stability
+    await visualMockPage.waitForPageSettle();
+
+    // 4. Scope screenshot to a specific element
+    const target = <pageObject>.page.locator('<selector>');
+    await target.waitFor({ state: 'visible', timeout: utils.TestTimeouts.UI_ELEMENT_VISIBILITY });
+
+    // 5. Take screenshot
+    await expect(target).toHaveScreenshot('<module>-<element>.png', {
+      animations: 'disabled',
+      mask: [<pageObject>.page.locator('time')],
+    });
+  });
+});
+```
+
+### Composite mock helpers
+
+`VisualMockPage` provides composite helpers that set up multiple intercepts in one call:
+
+| Method | Sets up |
+|---|---|
+| `setupVmListMocks()` | VM list + VMI list + empty Prometheus metrics |
+| `setupOverviewMocks()` | HCO status + Prometheus instant query + VM list |
+
+Use these for the common page types; call individual `mock*Api()` methods for other modules.
+
+### Masking dynamic regions
+
+Always mask elements that can vary between runs even with mocks:
+
+```typescript
+mask: [
+  page.locator('time'),                       // relative timestamps ("2 minutes ago")
+  page.locator('[data-test="last-sync-time"]'), // sync timestamp in toolbars
+  page.locator('[aria-label="Last sync time"]'),
+]
+```
+
+### Screenshot granularity
+
+Prefer **element-level** screenshots over full-page captures:
+- Table: `page.locator('table').first()`
+- Toolbar: `page.locator('[data-test="toolbar"], [role="toolbar"]').first()`
+- Tab strip: `page.locator('[role="tablist"]').first()`
+- Dialog: `page.locator('[role="dialog"]').first()`
+- Sidebar nav: `page.locator('nav[aria-label="Global"]').first()`
+
+Only fall back to `page.locator('main').first()` when a component doesn't expose a stable container selector.
+
+### Dialog tests
+
+Dialogs must be **opened but never submitted**:
+
+```typescript
+// Open the dialog
+await createButton.click();
+const dialog = page.locator('[role="dialog"]').first();
+await dialog.waitFor({ state: 'visible', timeout: utils.TestTimeouts.UI_ELEMENT_VISIBILITY });
+
+// Take screenshot
+await expect(dialog).toHaveScreenshot('create-foo-dialog.png', { animations: 'disabled' });
+
+// Close without submitting
+const cancel = dialog.locator('button[aria-label="Close"], button:has-text("Cancel")').first();
+if (await cancel.isVisible().catch(() => false)) {
+  await cancel.click();
+} else {
+  await page.keyboard.press('Escape');
+}
+```
+
+Use `test.skip()` (no-arg) when a dialog trigger isn't visible — this avoids hard failures on clusters where the feature isn't available.
+
+### Skip guards
+
+Wrap optional UI elements in a visibility check; use `test.skip()` when the element is absent rather than failing:
+
+```typescript
+const hasButton = await button
+  .waitFor({ state: 'visible', timeout: utils.TestTimeouts.UI_ELEMENT_VISIBILITY })
+  .then(() => true)
+  .catch(() => false);
+
+if (!hasButton) {
+  test.skip();
+  return;
+}
+```
+
+## Extending `VisualMockPage`
+
+When adding a new mock for a new module:
+
+1. Add the URL pattern constant and handler method to `visual-mock-page.ts`
+2. Track the handler via `this._addRoute(pattern, handler)` so `clearAllMocks()` can unroute it
+3. Add the corresponding deterministic payload to `visual-mock-data.ts`
+4. Export the payload constant with a clear name (e.g. `MOCK_QUOTAS_RESPONSE`)
+
+```typescript
+// In visual-mock-page.ts
+public async mockQuotasApi(): Promise<void> {
+  const handler = (route: Route) =>
+    VisualMockPage._jsonReply(route, MOCK_QUOTAS_RESPONSE);
+  await this._addRoute(
+    /\/api\/kubernetes\/apis\/aaq\.kubevirt\.io\/v1alpha1\/applicationsresourcequotas/,
+    handler,
+  );
+}
+```
+
+Never add `page.route()` calls inside spec files — they bypass the cleanup tracking.
+
+## Adding to `visual-fixture.ts`
+
+When a new module needs a page object not yet in the fixture:
+
+1. Import the page object at the top
+2. Add a property to the `VisualFixtures` interface
+3. Add the factory in `baseTest.extend<VisualFixtures>()`
+
+The fixture auto-calls `visualMockPage.clearAllMocks()` after every test via the fixture teardown — do not call it manually in `afterEach`.
+
+## Baseline Management
+
+```bash
+# Generate baselines (first run, or after intentional UI changes)
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression --update-snapshots
+
+# Detect regressions
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression
+
+# Run a single spec
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression tests/visual/visual-vm-list.spec.ts
+
+# Run with grep
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression --grep @visual
+```
+
+Baselines live in `playwright/tests/visual/__screenshots__/` and are committed to git. Never run `--update-snapshots` on a PR branch without an explicit review of the diff images.
+
+## Allure Metadata
+
+Always use the `VISUAL` / `VISUAL_TAG` constants:
+
+```typescript
+import { VISUAL, VISUAL_TAG } from '@/data-models/allure-constants';
+
+test.describe('...', { tag: [VISUAL_TAG] }, () => {
+  test('...', async ({ utils }) => {
+    utils.withAllure({ suite: SUITE, feature: VISUAL, tags: [VISUAL_TAG] });
+  });
+});
+```
+
+## Convention Checklist
+
+- [ ] Imports from `@/fixtures/visual-fixture`, not `scenario-test-fixture` or `@playwright/test`
+- [ ] All `page.route()` calls go through `VisualMockPage` methods — never inline in spec
+- [ ] `mock*Api()` / `setupVmListMocks()` called BEFORE `navigate*ViaUI()`
+- [ ] `waitForPageSettle()` called after navigation and before screenshot
+- [ ] `toHaveScreenshot()` uses `animations: 'disabled'`
+- [ ] Dynamic regions (`time`, `last-sync-time`) are masked
+- [ ] Dialogs are opened but never submitted
+- [ ] `test.skip()` used (not `expect.fail()`) when an optional UI element is absent
+- [ ] No cluster resources created; empty-state namespace tracked via `cleanup.trackNamespace()`
+- [ ] Baseline filename is kebab-case and describes the captured element (e.g. `vm-list-table.png`)
+- [ ] Suite constant `const SUITE = 'Visual — <Module>'` declared at file top
+- [ ] No `ID(CNV-XXXXX)` in test titles
+
+## Module Coverage Map
+
+| Module | Spec file | Key screenshots |
+|---|---|---|
+| VM List | `visual-vm-list.spec.ts` | table, toolbar, status badge, empty state |
+| VM Namespace Overview | `visual-vm-overview.spec.ts` | overview tab widgets, tab strip |
+| Virtualization Overview | `visual-virtualization-overview.spec.ts` | resource cards, migration widget, sidebar |
+| Templates | `visual-templates.spec.ts` | table, toolbar, column headers |
+| Bootable Volumes | `visual-bootable-volumes.spec.ts` | table, column headers, toolbar |
+| Instance Types | `visual-instance-types.spec.ts` | cluster tab, tab strip, user tab empty state |
+| Migration Policies | `visual-migration-policies.spec.ts` | table, page header, toolbar |
+| Dialogs | `visual-dialogs.spec.ts` | Create VM catalog, Delete VM, Create MigrationPolicy, Add Bootable Volume |
+
+## Expanding Coverage
+
+To add a new module:
+
+1. Add the mock payload to `visual-mock-data.ts`
+2. Add the `mock<Resource>Api()` method to `visual-mock-page.ts`
+3. Add the page object to `visual-fixture.ts` if not already present
+4. Create `playwright/tests/visual/visual-<module>.spec.ts` following the standard pattern above
+5. Run with `--update-snapshots` to generate baselines
+6. Commit the baseline PNGs alongside the spec

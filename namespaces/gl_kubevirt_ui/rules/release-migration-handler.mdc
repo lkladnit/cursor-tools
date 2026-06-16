@@ -1,0 +1,232 @@
+---
+description: Release Spec Handler agent - Maintains release-specific Playwright spec files under playwright/tests/releases/ (one spec per CNV release, 4.12–4.21). All specs already exist and are the source of truth. Updates are driven by live cluster failures, not Cypress branches.
+globs: playwright/tests/releases/**/*.spec.ts
+alwaysApply: false
+---
+
+# Release Spec Handler Agent
+
+You maintain the release-specific Playwright spec files under `playwright/tests/releases/`. One spec file exists per CNV release (4.12–4.21). These specs are the canonical source of truth — they have already been ported from Cypress and are no longer compared against or synced from Cypress source branches.
+
+Updates are driven exclusively by:
+- Failures discovered when running the specs against a live cluster
+- UI/selector changes observed in the live cluster via Playwright MCP
+- Explicit user requests to add, skip, or modify specific tests
+
+## Command
+
+```
+/release-spec <version> [options]
+```
+
+### Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `<version>` | Yes | CNV version(s): `4.21`, `4.19 4.20`, `--all` |
+| `--run` | No | Execute the spec after updating it |
+| `--diff` | No | Show what changed since the last git commit (spec content diff) |
+
+### Examples
+
+```
+/release-spec 4.21
+/release-spec 4.19 4.20 4.21
+/release-spec --all
+/release-spec 4.21 --run
+/release-spec 4.21 --diff
+```
+
+---
+
+## Output Location
+
+```
+playwright/tests/releases/
+  release-4.12.spec.ts
+  release-4.13.spec.ts
+  ...
+  release-4.21.spec.ts
+```
+
+**One file per release. No other files are created.**
+
+---
+
+## Constraints
+
+- **No PageObjects** — use `page.locator()` / `page.getByTestId()` directly
+- **Use the shared release fixture** — always import `test` and `expect` from `@/fixtures/releases-fixture`
+- **No new helper files** — all helpers are async functions defined inside the spec file
+- **No Allure metadata** — no `withAllure`, no `T1_TAG`, no suite annotations
+- **One allowed data-layer edit**: `playwright/src/data-models/constants.ts` (add `VM_STATUS` / `VM_ACTION` if absent)
+- **External data** must use existing imports from `@/utils/template-constants` and `testConfig.testNamespace`
+- **Never re-sync from Cypress branches** — the Playwright spec is the source of truth, not the old Cypress code
+
+---
+
+## Tag Convention (Release-Versioned Tags)
+
+Every `test.describe` **must** use release-versioned tags to prevent tag collision with mainline tests. Generic tags like `@tier1`, `@gating`, `@priv` are **forbidden** in release specs.
+
+### Tag format: `@<tier>-4.<version>`
+
+| Tag | Meaning |
+|-----|---------|
+| `@release-4.XX` | Identifies the release (always present) |
+| `@gating-4.XX` | Gating suite for release 4.XX |
+| `@tier1-4.XX` | Tier1 suite for release 4.XX |
+| `@tier2-4.XX` | Tier2 suite for release 4.XX |
+| `@priv-4.XX` | Requires admin privileges |
+| `@nonpriv-4.XX` | Runs in non-privileged mode |
+
+### Running filtered subsets
+
+```bash
+# Run only gating tests for 4.21
+npx playwright test --project="Release Specs" --grep "@gating-4.21"
+
+# Run tier1 nonpriv for 4.18
+npx playwright test --project="Release Specs" --grep "@tier1-4.18" --grep-invert "@priv-only"
+
+# Run all tier1 + gating for a specific release
+npx playwright test --project="Release Specs" --grep "@gating-4.21|@tier1-4.21"
+
+# Run nonpriv tests across all releases
+npx playwright test --project="Release Specs" --grep "@nonpriv"
+```
+
+---
+
+## Spec File Structure
+
+```typescript
+/**
+ * Release 4.XX — Playwright E2E for CNV release 4.XX
+ * Source of truth: this file (no Cypress sync)
+ */
+
+import { execSync } from 'child_process';
+import type { Page } from '@playwright/test';
+
+import { expect, test } from '@/fixtures/releases-fixture';
+import { TEMPLATE_METADATA_NAMES } from '@/utils/template-constants';
+import { TestTimeouts } from '@/utils/test-config';
+import { VM_STATUS, VM_ACTION } from '@/data-models/constants';
+
+// ─── constants ────────────────────────────────────────────────────────────────
+const TEST_VM_NAME = 'auto-test-vm';
+const TEST_IT_NAME = 'auto-it-vm';
+
+// ─── selectors ────────────────────────────────────────────────────────────────
+const vmNav = '[data-test-id="virtualmachines-nav-item"]';
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+async function waitForVmStatus(page: Page, vmName: string, status: string): Promise<void> { ... }
+
+// ─── test suites ──────────────────────────────────────────────────────────────
+test.describe('cypress_tests_gating_gating_tabs-are-loaded', { tag: ['@release-4.XX', '@gating-4.XX', '@priv-4.XX'] }, () => {
+  test('ID(CNV-XXXXX) tab loads', async ({ page, testConfig }) => { ... });
+});
+```
+
+---
+
+## PatternFly Era Reference
+
+| Era | Versions | PF Class Prefix |
+|-----|----------|-----------------|
+| Legacy | 4.12–4.14 | `.pf-c-*` |
+| PF5 | 4.15–4.18 | `.pf-v5-c-*` |
+| PF6 | 4.19–4.21 | `.pf-v6-c-*` |
+
+PF class selectors in the spec files target the release's UI and should be preserved unless the live cluster shows they have changed. `data-test-id` / `data-test` selectors are PF-era-agnostic and preferred where available.
+
+---
+
+## Running Release Specs
+
+```bash
+# Single release
+npx playwright test --project="Release Specs" --grep "@release-4.21" --config=playwright/playwright.config.ts
+
+# Multiple releases
+npx playwright test --project="Release Specs" --grep "@release-4.19|@release-4.20|@release-4.21" --config=playwright/playwright.config.ts
+
+# All release specs
+npx playwright test --project="Release Specs" --config=playwright/playwright.config.ts
+
+# Debug a specific test
+npx playwright test --project="Release Specs" --grep "ID(CNV-8839)" --workers=1 --config=playwright/playwright.config.ts
+```
+
+---
+
+## Update Workflow
+
+All updates follow the same flow — the source of truth is always the live cluster, not an external branch.
+
+1. Read `.env` to confirm the cluster identity (`WEB_CONSOLE_URL`, `CLUSTER_URL`)
+2. If `--diff` was passed, show `git diff HEAD playwright/tests/releases/release-4.XX.spec.ts` and ask before proceeding
+3. Run the spec against the live cluster to collect current failures:
+   ```bash
+   npx playwright test --project="Release Specs" --grep "@release-4.XX" --config=playwright/playwright.config.ts
+   ```
+4. For each failure, inspect the live UI to identify the current selector or behaviour. Check tool availability first:
+   ```bash
+   playwright-cli --version 2>/dev/null && echo "available" || echo "unavailable"
+   ```
+
+   **With `playwright-cli` (preferred)**:
+   ```bash
+   playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+   playwright-cli resize 1920 1080
+   playwright-cli goto <failing-page-URL>
+   playwright-cli snapshot                                                          # find current selectors
+   playwright-cli eval 'document.querySelector("[data-test-id=\"my-selector\"]")?.textContent'
+   playwright-cli console error                                                     # any JS errors blocking render?
+   playwright-cli requests                                                          # any ERR_ABORTED blocking the page?
+   playwright-cli screenshot
+   playwright-cli close
+   ```
+
+   **Fallback — Playwright MCP** (if `playwright-cli` is unavailable):
+   Use `Playwright-browser_navigate`, `Playwright-browser_snapshot`, `Playwright-browser_evaluate`, and `Playwright-browser_take_screenshot`. Note: console errors and network request details are not available via MCP.
+
+   See `orchestrator.mdc § Browser Automation Tool` for the full capability matrix.
+5. Fix the failing test using what the live cluster shows
+6. Re-run to verify the fix passes
+7. Repeat until all tests pass or the remaining failures are explicitly skipped with a reason comment
+
+---
+
+## Branch Protocol
+
+**Always create and switch to a feature branch before writing any spec file.**
+
+```bash
+# Resolve username
+git config user.email | cut -d@ -f1
+
+# Single release update
+git checkout -b <username>/release-4.XX-update
+
+# Multi-release update
+git checkout -b <username>/release-update-4.XX-4.XX
+```
+
+If a matching branch already exists, switch to it (`git checkout`) rather than creating a new one.
+
+**Never write spec files while on `main`.**
+
+---
+
+## Rules
+
+- **Always be on a feature branch** before modifying any spec file
+- **Never re-sync from Cypress branches** — the spec file is the source of truth
+- **Never create files outside `playwright/tests/releases/`** except the one allowed edit to `constants.ts`
+- **Never import from `@/page-objects/`** — keep tests procedural
+- **Preserve test IDs** (e.g., `ID(CNV-8839)`) in test names verbatim
+- **Keep skipped tests** as `test.skip` / `test.describe.skip` with a reason comment — do not delete them
+- **Never commit directly to `main`**

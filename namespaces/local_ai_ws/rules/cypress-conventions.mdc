@@ -1,0 +1,26 @@
+---
+description: Cypress end-to-end test conventions
+globs: cypress/**/*.cy.ts
+alwaysApply: false
+---
+
+# Cypress Conventions
+
+- Use `data-cy` attributes for selectors — keep tests decoupled from styling and structure
+- Never use `cy.wait(ms)` for arbitrary delays — use `cy.intercept` + `cy.wait("@alias")` for network
+- Chain assertions directly — avoid storing Cypress subjects in variables
+- Use `beforeEach` for common navigation/setup, not `before`
+- Use `cy.intercept` to stub API responses for deterministic tests
+
+```typescript
+// ❌ BAD
+cy.get(".btn-submit").click();
+cy.wait(5000);
+cy.get(".toast").should("exist");
+
+// ✅ GOOD
+cy.intercept("POST", "/api/users").as("createUser");
+cy.get("[data-cy=submit-button]").click();
+cy.wait("@createUser").its("response.statusCode").should("eq", 201);
+cy.get("[data-cy=success-toast]").should("be.visible");
+```

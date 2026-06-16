@@ -1,0 +1,37 @@
+---
+description: TypeScript strict coding patterns
+globs: **/*.ts
+alwaysApply: false
+---
+
+# TypeScript Patterns
+
+- Prefer `unknown` over `any` — narrow with type guards
+- Use discriminated unions over optional fields for state modeling
+- Prefer `interface` for object shapes, `type` for unions/intersections
+- Use `as const` for literal tuples and enums instead of casts
+- Never use non-null assertion (`!`) — handle the null case explicitly
+
+```typescript
+// ❌ BAD
+type Response = {
+  data?: string;
+  error?: string;
+};
+
+function handle(input: any) {
+  return input.name!.toUpperCase();
+}
+
+// ✅ GOOD
+type Response =
+  | { status: "success"; data: string }
+  | { status: "error"; error: string };
+
+function handle(input: unknown) {
+  if (isUser(input)) {
+    return input.name.toUpperCase();
+  }
+  throw new TypeError("Expected a User object");
+}
+```

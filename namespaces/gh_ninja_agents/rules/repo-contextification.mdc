@@ -1,0 +1,14 @@
+---
+description: "Audit a repository for documentation completeness and AI-readiness, then scaffold missing files (README, CONTRIBUTING, AGENTS, ARCHITECTURE, .coderabbit.yaml). Use when the user asks to contextify a repo, audit repo docs, add repo documentation, or set up a repo for AI."
+alwaysApply: false
+---
+
+# Repo Contextification
+
+Read `.claude/agents/repo-contextification.md` and follow the complete workflow described there.
+
+The agent spec contains all steps, MCP tool call examples, validation checkpoints, style guides, and rules. It is the single source of truth for this workflow.
+
+Ignore the YAML frontmatter fields `model` and `memory` — those are Claude Code-specific and have no effect in Cursor.
+
+For best results, use Claude Opus or an equivalent model in Cursor settings.

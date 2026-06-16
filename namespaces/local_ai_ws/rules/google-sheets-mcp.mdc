@@ -1,0 +1,31 @@
+---
+description: Google Sheets MCP server setup (OAuth + service account)
+alwaysApply: false
+---
+
+# Google Sheets MCP
+
+Project: `google-sheets-mcp/`
+
+## Auth modes
+
+| `GOOGLE_AUTH_MODE` | Use case |
+|--------------------|----------|
+| `oauth` | User's own Drive (run `npm run auth` first) |
+| `service_account` | Shared/team sheets (share with SA email) |
+| `auto` | OAuth token if present, else service account |
+
+## OAuth one-time login
+
+```bash
+export GOOGLE_OAUTH_CLIENT_PATH=/path/to/oauth-client.json
+cd google-sheets-mcp && npm run auth
+```
+
+Redirect URI in Google Cloud: `http://127.0.0.1:38473/oauth2callback`
+
+## Cursor: both accounts
+
+Register two servers with different names — `google-sheets` (oauth) and `google-sheets-sa` (service_account). Same binary, different `env`.
+
+Rebuild: `cd google-sheets-mcp && npm run build`

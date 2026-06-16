@@ -1,0 +1,237 @@
+---
+description: Workflow for working with Jira tickets using MCP
+alwaysApply: false
+---
+
+# Jira Workflow
+
+Invoke with: *"get my tickets"*, *"show sprint issues"*, *"update ticket"*, *"search jira"*, *"create a bug"*, *"file a bug"*
+
+This workflow covers Jira MCP operations. For the full development workflow (ticket to PR), see `feature-development.mdc`.
+
+---
+
+## 1. Finding Tickets
+
+**Get My Assigned Tickets**
+```
+"Show my assigned tickets"
+```
+→ Uses `jira_search` with JQL: `assignee = currentUser() AND status != Done`
+
+**Get Current Sprint Tickets**
+```
+"Show current sprint tickets"
+```
+→ Uses `jira_get_sprint_issues`
+
+**Search for Specific Tickets**
+```
+"Find open bugs in CNV project"
+```
+→ Uses `jira_search` with appropriate JQL
+
+**Get Ticket Details**
+```
+"Get details for CNV-12345"
+```
+→ Uses `jira_get_issue`
+
+---
+
+## 2. Common JQL Queries
+
+### By Status
+```jql
+assignee = currentUser() AND status = "In Progress"
+status = "Ready for Dev" AND project = CNV
+status = "Code Review" AND assignee = currentUser()
+```
+
+### By Type
+```jql
+issuetype = Bug AND project = CNV AND status != Done
+issuetype = Story AND assignee = currentUser()
+issuetype = Epic AND project = CNV
+```
+
+### By Time
+```jql
+updated >= -7d AND assignee = currentUser()
+created >= startOfWeek() AND project = CNV
+duedate <= 7d AND duedate >= 0d
+```
+
+### By Label/Component
+```jql
+labels = ui AND project = CNV
+component = "Virtual Machines" AND status != Done
+```
+
+---
+
+## 3. Updating Tickets
+
+**Add a Comment**
+```
+"Add comment to CNV-12345: Started investigating the issue"
+```
+→ Uses `jira_add_comment`
+
+**Update Status**
+```
+"Move CNV-12345 to Code Review"
+"Mark CNV-12345 as blocked"
+```
+→ Uses `jira_transition_issue`
+
+**Log Work**
+```
+"Log 2 hours on CNV-12345"
+```
+→ Uses `jira_add_worklog`
+
+---
+
+## 4. Ticket Analysis
+
+When fetching a ticket, analyze:
+
+- **Summary**: High-level goal
+- **Description**: Detailed requirements and context
+- **Acceptance Criteria**: What defines "done"
+- **Related Issues**: Blockers, dependencies, related work
+- **Comments**: Discussion and clarifications
+- **Affected Areas**: Which parts of codebase to modify
+- **Risks**: Potential challenges or unknowns
+
+---
+
+## 5. Creating Bugs
+
+Invoke with: *"create a bug"*, *"file a bug for ..."*, *"report a bug"*
+
+All bugs in this project must be created in the **CNV** project with the **CNV User Interface** label.
+
+**Important:** Bug descriptions must be written from the **user's perspective**. Do not include technical implementation details (React components, hooks, state management, TypeScript types, etc.). Describe the problem in terms of what the user sees and experiences — QE engineers and end users should be able to understand the impact without reading code.
+
+### Required Fields
+
+| Field | Value |
+|-------|-------|
+| `project_key` | `CNV` |
+| `issue_type` | `Bug` |
+| `additional_fields.labels` | `["CNV User Interface"]` |
+| `additional_fields.fixVersions` | Always set to the **latest** CNV version |
+
+### Description Template
+
+Always use this template for the bug description:
+
+```
+Description of problem:
+
+{problem_description}
+
+Version-Release number of selected component (if applicable):
+
+{version}
+
+How reproducible:
+
+{reproducibility}
+
+Steps to Reproduce:
+
+1. {step1}
+2. {step2}
+3. {step3}
+
+Actual results:
+
+{actual}
+
+Expected results:
+
+{expected}
+
+Additional info:
+
+{additional}
+```
+
+### Example MCP Call
+
+```
+jira_create_issue:
+  project_key: "CNV"
+  summary: "Button X is not clickable on the settings page"
+  issue_type: "Bug"
+  additional_fields:
+    labels: ["CNV User Interface"]
+    fixVersions: [{"name": "CNV 4.22.0"}]
+  description: |
+    Description of problem:
+
+    The "Save" button on the settings page is not clickable after changing a value.
+
+    Version-Release number of selected component (if applicable):
+
+    CNV 4.21.1-77
+
+    How reproducible:
+
+    Always
+
+    Steps to Reproduce:
+
+    1. Go to Virtualization → Settings
+    2. Change any value
+    3. Click "Save"
+
+    Actual results:
+
+    Nothing happens when clicking the button.
+
+    Expected results:
+
+    The settings should be saved and a success notification should appear.
+
+    Additional info:
+
+    Console shows no errors. Tested on Chrome and Firefox.
+```
+
+### Workflow
+
+1. Ask the user for the bug summary and details (or extract from context)
+2. Fill in the template fields — leave sections as empty space if not provided
+3. Create the issue with `jira_create_issue` using project `CNV`, type `Bug`, and label `CNV User Interface`
+4. Return the created ticket key and URL to the user
+
+---
+
+## 6. MCP Tool Reference
+
+| Tool | Purpose |
+|------|---------|
+| `jira_search` | Find tickets with JQL |
+| `jira_get_issue` | Get ticket details |
+| `jira_create_issue` | Create new issues (bugs, stories, etc.) |
+| `jira_add_comment` | Add comments |
+| `jira_transition_issue` | Change status |
+| `jira_add_worklog` | Log time |
+| `jira_update_issue` | Update fields |
+| `jira_get_sprint_issues` | Get sprint issues |
+
+Tools are called automatically when you make requests. Just describe what you want in natural language.
+
+---
+
+## 7. Tips
+
+- Be specific: "Show bugs assigned to me" vs "show issues"
+- Use project codes: "CNV-12345" not just "12345"
+- Check ticket comments before starting work
+- Add comments when starting/finishing work
+- Document blockers in ticket comments

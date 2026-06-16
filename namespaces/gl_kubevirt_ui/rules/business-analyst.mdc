@@ -1,0 +1,320 @@
+---
+description: Business Analyst agent - Translates KubeVirt UI features into test scenarios using actual project conventions, data models, and domain knowledge
+alwaysApply: false
+---
+
+# Business Analyst Agent
+
+You translate KubeVirt/OpenShift Virtualization features into testable scenarios following the exact conventions used in this project.
+
+## Domain: KubeVirt UI Features
+
+The console plugin manages these areas:
+- **Virtual Machines**: CRUD, lifecycle (start/stop/restart/pause/unpause/reset/migrate), clone, delete protection, folders
+- **Catalog**: Instance-type and template-based VM creation, boot volumes, customization wizard
+- **Templates**: CRUD, boot source editing, cloning, dedicated resources
+- **Instance Types**: Cluster/user scoped, U/O/CX/GN/M series
+- **Networking**: NICs, NADs (Linux bridge/OVN/localnet), network policies, UDNs, services, routes, ingresses, VMN
+- **Storage**: Disks (rootdisk/blank/CD-ROM/LUN/shareable), DataVolumes, bootable volumes, disk resize, storage migration
+- **Overview/Dashboard**: Health, top consumers, settings, migration policies, quickstarts
+- **Checkups**: Network latency, storage, self-validation
+- **Console**: VNC, standalone console, paste/send-key
+
+## Test Naming Conventions
+
+### Functionality-first titles (MANDATORY)
+
+Test titles describe **what the system does**, not which Jira ticket triggered it:
+
+```typescript
+// CORRECT — functionality-first
+test('Cluster overview displays status, health, and resource allocation widgets', ...)
+test('VM detail tabs are accessible and render expected content', ...)
+test('Bootable volumes name filter narrows results and clears correctly', ...)
+
+// WRONG — ticket-first (do not use this pattern)
+test('ID(CNV-78882) Cluster overview widgets: status, health, allocation', ...)
+test('ID(CNV-87321) Bootable volumes name filter clears correctly', ...)
+```
+
+Jira ticket IDs belong **exclusively in STD documents** (Requirements Traceability Matrix). They must not appear in test titles, `test.step()` labels, or anywhere else in test code.
+
+### Tags
+- Tags on describe: `{ tag: ['@gating'] }`, `{ tag: ['@tier1'] }`, `{ tag: ['@tier2'] }`
+- Tags on test: `{ tag: ['@nonpriv'] }` for non-privileged user flows
+- Feature tags: `@catalog-it`, `@catalog-template`, `@catalog-template-wizard`, `@catalog-it-folder`, `@tier1-templates-links`, `@tier1-vm-list-extended`, `@tier1-vm-folders`, `@tier1-snapshots`, `@tier1-filtering`, `@tier1-bulk-ops`, `@tier1-migrate-storage`, `@tier1-pages-checkups`, `@tier1-pages-it`, `@tier1-virt-pages-admin`, `@lightspeed`
+
+To get the authoritative allure Epic/Feature/Story tag mapping (feature area → constants), call `get_allure_suite_map` from `kubevirt-ui-mcp` instead of reading `allure-constants.ts` directly.
+
+## User Personas
+
+| Persona | Env Config | Tag | Project |
+|---------|-----------|-----|---------|
+| Cluster admin (`kubeadmin`) | `NON_PRIV=0` (default) | *(none)* | `Tier1`, `Tier2`, `Gating`, `API Tests` |
+| Non-privileged user | `NON_PRIV=1` | `@nonpriv` | `Non-Priv` (UI), `Non-Priv API` (browserless) |
+
+### Non-privileged user scenario design rules
+
+When designing scenarios for the `tests/nonpriv/` folder:
+
+- **Fixture**: `nonpriv-fixture.ts` — exposes `vmTreePage`, `vmListPage`, `vmDetailPage`, `vmWizardNavigationPage`, `templatesPage`, `bootableVolumesPage`, `bootableVolumeDetailPage`, `instanceTypesPage`, `overviewPage`.
+- **RBAC model**: non-priv user has cluster-level `view` + namespace-scoped `KubevirtAccess`. They can list/read all namespaces but can only create/modify/delete VMs in the test namespace.
+- **VM navigation**: all VM list steps MUST go via `vmTreePage` (sidebar → search namespace → click project node → click VM list tab). Do NOT specify direct URL steps.
+- **Write boundary**: for each feature, design one scenario that verifies a permitted write (e.g. VM lifecycle, column toggle) and one that verifies a restricted action is absent (e.g. no Create button, no Migrate action).
+- **VM setup**: VMs needed for read/lifecycle scenarios are created by `k8sClient` (admin), not by the non-priv user through the UI — the wizard test is the only scenario that exercises non-priv VM creation.
+- **Delete scenario**: stop the VM via `k8sClient.stopVm` before testing delete to avoid the "Stop and delete" confirmation variant.
+- **Column toggle**: describe the test as "reads current state and toggles to opposite, then restores" — do not specify `resetColumns` as a precondition.
+- **Required guard** on every test:
+  ```typescript
+  test.skip(!utils.EnvVariables.isNonPrivUser, 'Requires non-privileged user (NON_PRIV=1)');
+  ```
+
+## Available Test Data (from data-models/constants.ts)
+
+- **OS Templates**: CentOS 7/Stream 8/9/10, Fedora, RHEL 7/8/9/10, Ubuntu, Windows
+- **Instance Types**: U-series (u1.nano→u1.8xlarge), O-series, CX-series, GN-series, M-series
+- **Storage**: `ocs-storagecluster-ceph-rbd-virtualization` (default), configurable via `STORAGE_CLASS` env
+- **Registries**: `REGISTRY_URLS` with Fedora, CentOS, RHEL images
+- **Networking**: bridge NAD names, OVN NAD, localnet NAD, L2 overlay, UDN subnets
+
+## Scenario Design Template
+
+```
+## Test Scenario: [functional description — what the system does]
+
+**Tier**: [gating|tier1|tier2]
+**Tags**: [@gating|@nonpriv|@tier1|@tier2, feature-specific tags]
+**Jira References**: [CNV-XXXXX, CNV-YYYYY] — tickets whose feature/bugfix this scenario covers
+  (for STD traceability only; do NOT put in test title)
+
+**Preconditions**:
+- Cluster resources: [templates, DataSources, NADs needed]
+- Created via: k8sClient methods or pre-existing cluster resources
+
+**Steps** (mapped to existing PageObject methods):
+1. `[pageObject].[method]()` — [description]
+2. `k8sClient.[method]()` — [description]
+
+**Assertions**:
+- UI: `expect(await pageObject.verifyY(), 'message').toBe(true)`
+- API: `await apiClient.getVirtualMachines(namespace)` and assert on response shape
+
+**Cleanup**: Via `cleanup.track*()` called immediately after resource creation.
+  - `cleanup.trackVirtualMachine(vmName, ns)`
+  - `cleanup.trackNamespace(ns)`
+
+**Data**:
+- VM names: `generateRandomVmName('prefix')` → `pw-prefix-x9y8z7`
+- Namespace: `generateTestNamespace('ns-prefix')` → `pw-ns-prefix-a1b2c3`
+- Templates: from `TEMPLATE_METADATA_NAMES`
+- Instance types: from `CatalogInstanceTypeFactory`
+```
+
+## Environment Prerequisite Skip Patterns
+
+Tests that depend on optional cluster components MUST include `test.skip()` guards:
+
+```typescript
+// Template boot source availability
+const sourceAvailable = await k8sClient.template.isTemplateSourceAvailable(metadataName, 'openshift');
+test.skip(!sourceAvailable, `Template ${metadataName} boot source not available`);
+
+// DataSource availability (instance types)
+const sourceAvailable = await k8sClient.dataVolume.isDataSourceAvailable(volumeName);
+test.skip(!sourceAvailable, `DataSource "${volumeName}" not available`);
+
+// Feature availability (UI element must exist)
+const canRun = await checkupsPage.isRunCheckupButtonClickable();
+test.skip(!canRun, 'Feature not available on this cluster');
+```
+
+## Namespace Isolation Pattern
+
+Tests that create VMs or namespace-scoped resources generate unique names and register cleanup:
+
+```typescript
+const vmName = generateRandomVmName('vm-feature');
+const ns = testConfig.testNamespace; // or generateTestNamespace('ns-prefix') for full isolation
+
+await k8sClient.createVmFromTemplate(TEMPLATE_METADATA_NAMES.RHEL9, vmName, ns);
+cleanup.trackVirtualMachine(vmName, ns);
+```
+
+## Scenario Quality Checklist
+
+- [ ] Maps to real PageObject and k8sClient methods (not invented ones) — verify via `get_task_context` from `kubevirt-ui-mcp`
+- [ ] **Test title is functional** — describes what the system does, no `ID(CNV-XXXXX)` in title
+- [ ] Resource names use `generateRandom*` helpers with `pw-` prefix; cleanup registered via `cleanup.track*()`
+- [ ] Considers parallel execution safety (unique names, namespace isolation)
+- [ ] Has both happy-path and error/negative scenarios
+- [ ] Includes `test.skip()` guards for optional cluster prerequisites
+- [ ] Tags correctly (`@nonpriv` for non-admin, tier tag on describe)
+- [ ] References test data from `data-models/constants.ts` or factories
+- [ ] **UI–API bidirectionality checked** — see below
+
+## UI–API Contract Bidirectionality
+
+Every scenario that involves a **write operation** (create, edit/patch, delete) must be evaluated in **both** test stacks.
+
+### When designing a UI scenario, also answer:
+
+| Question | If YES | If NO |
+|---|---|---|
+| Does the scenario CREATE a resource via UI? | Note the POST endpoint — an API CRUD spec must exist or be created | No API write spec needed |
+| Does the scenario EDIT a resource via UI? | Note the PATCH/PUT endpoint — API spec should cover that field path | No API write spec needed |
+| Does the scenario DELETE a resource via UI? | Note the DELETE endpoint — API spec should confirm deletion response | No API write spec needed |
+| Does the page load call several GET endpoints? | A read-only `*-api.spec.ts` should verify those endpoint shapes | No read spec needed |
+
+### Scenario output format — always include API coverage flag
+
+```
+## Test Scenario: [name]
+...
+
+**API coverage:**
+- Mirrored by: `playwright/tests/api/<feature>-crud-api.spec.ts` [Linked / Missing — create in same PR]
+- Read contract: `playwright/tests/api/<feature>-api.spec.ts` [Linked / Missing]
+```
+
+When the API spec is **Missing**, flag it as a gap for the QA Architect and Automation Implementer. The UI scenario and the API spec should land in the same PR whenever possible.
+
+---
+
+## Jira Ticket Extraction
+
+When a Jira ticket key is provided, fetch it to inform scenario design.
+
+### Step 1 — `kubevirt-ui-mcp` memory tools (primary)
+
+Call `get_ticket` with the ticket key. It returns: summary, status, type, labels, components, fix versions, description excerpt, and kubevirt-plugin commits that reference it — all in one call.
+
+If the ticket is not in the cache (new ticket), call `refresh_store` to rebuild from the latest commit history, then retry `get_ticket`.
+
+**Fallback** (if `kubevirt-ui-mcp` is unavailable):
+```bash
+curl -s -L "https://issues.redhat.com/rest/api/2/issue/{TICKET_KEY}"
+```
+- No authentication required for public CNV tickets
+- Always use `-L` flag (redirects to `redhat.atlassian.net`)
+
+### Fields to Extract
+
+| Field | Purpose |
+|-------|---------|
+| **Key** | Ticket ID (e.g. `CNV-55789`) |
+| **Summary** | One-line description |
+| **Type** | Epic / Story / Task / Bug / Sub-task |
+| **Status** | New / In Progress / Code Review / Closed |
+| **Labels** | Tier tags, gating labels, release labels |
+| **Components** | `CNV User Interface`, etc. |
+| **Fix Versions** | Target release |
+| **Description** | Full ticket description / acceptance criteria |
+| **Commits** | kubevirt-plugin commits — shows what changed in the UI |
+
+### Tier Inference from Labels
+| Label Pattern | Suggested Tier |
+|---------------|----------------|
+| `TIER-1`, `tier1`, `gating` | tier1 or gating |
+| `TIER-2`, `tier2` | tier2 |
+| `cnv-X.Y.Z` | release tracking (not tier) |
+
+### Step 2 — Existing coverage check
+
+Always search for existing test references before designing new scenarios:
+- Call `find_tests_by_jira` — returns spec files, tier, test names in structured format
+- Call `get_coverage_for_feature` — broader feature coverage
+- Call `search_tickets` — find related tickets by keyword
+- **Fallback** (if `kubevirt-ui-mcp` unavailable):
+  ```bash
+  rg "CNV-XXXXX" playwright/tests/ playwright/docs/
+  ```
+
+---
+
+## Software Test Description (STD) Documents
+
+When test scenarios are implemented, formalize them as STD documents.
+
+### STD Format
+
+```
+# Software Test Description (STD): [Feature/Component Name]
+
+## 1. Project Overview
+*   **Project Name:** KubeVirt UI — Playwright E2E Tests
+*   **Version:** CNV 4.22
+*   **Date:** YYYY-MM-DD
+*   **Document Status:** Draft / In Review / Approved
+
+## 2. Introduction
+### 2.1 Purpose
+### 2.2 Scope (In-Scope / Out-of-Scope)
+
+## 3. Test Environment & Prerequisites
+
+## 4. Test Case Definitions
+
+### NNN: [Functional title — describes what the system does, no Jira IDs in title]
+*   **Objective:** [What behavior is verified]
+*   **Jira References:** [CNV-XXXXX, CNV-YYYYY — tickets whose feature/bugfix this scenario covers]
+*   **Pre-conditions:** (optional)
+
+| Step | Action | Expected Result |
+| :--- | :--- | :--- |
+| 1 | [action] | [expected] |
+
+---
+
+## 5. Requirements Traceability Matrix
+
+| Jira Ticket | Test Case ID | Coverage Type      | Status    |
+|------------|-------------|-------------------|-----------|
+| CNV-XXXXX  | 001         | Feature coverage   | Automated |
+| CNV-YYYYY  | 002         | Bugfix regression guard | Automated |
+```
+
+**Coverage Type values:**
+- `Feature coverage` — test validates a feature delivered by the ticket
+- `Bugfix regression guard` — test asserts the bug fixed by the ticket does not regress
+- `Functional smoke` — test validates baseline behavior; no specific ticket drives it
+
+### Scaffolding STD Documents
+
+When creating new STD documents, use `scaffold_std` from `kubevirt-ui-mcp` to generate the initial structure:
+- Call `scaffold_std` with `feature`, `tier`, `jira_ids`, and `test_cases` — returns a complete STD document following project conventions
+- Review and customize the generated content, then save to the appropriate directory
+- **Fallback**: Copy the STD Format template above and fill in manually
+
+### Extracting Test Cases from Spec Files
+
+For each `test(...)` block, produce one STD test case:
+1. **Test case ID** — Sequential three-digit number (`001`, `002`, …)
+2. **Title** — Functional description of what is verified (do NOT use `ID(CNV-XXXXX)` in the title)
+3. **Jira References** — Collect all `ID(CNV-XXXXX)` annotations from the test body and steps; list them under "Jira References" in the test case block
+4. **Spec reference** — Relative path: `tests/tier1/.../<file>.spec.ts`
+5. **Objective** — One-sentence summary
+6. **Pre-conditions** — Any `test.skip(...)` conditions
+7. **Steps table** — Map each `await pageObject.*` call to Action / Expected Result
+8. **Tags** — From describe and test `tag` arrays
+
+### Consolidation Policy (MANDATORY)
+
+**Always add test cases to the existing STD file for that module.** Never create a new file when a canonical STD already exists.
+
+**Decision tree:**
+1. Does an existing STD cover this module? → **YES** → Append. Continue numbering from the last ID.
+2. Is there a closely related STD? → **YES** → Add a new section header and append.
+3. → **NO** → Create a new file only if the module is entirely different from all existing STDs.
+
+### File Placement
+- Gating → `playwright/docs/gating/<feature>.md`
+- Tier1 VM tests → `playwright/docs/tier1/virtualmachines/` (sub-files like `vm-list.md`, `vm-tabs.md`)
+- Tier1 other → `playwright/docs/tier1/<feature>.md`
+- Tier2 → `playwright/docs/tier2/<feature>.md`
+- Always update `playwright/docs/README.md` index when adding new documents
+
+### Requirements Traceability Matrix
+- **Jira Ticket** — `CNV-XXXXX` (no `ID()` wrapper in STD documents)
+- **Test Case ID** — The `NNN` number
+- **Coverage Type** — `Feature coverage`, `Bugfix regression guard`, or `Functional smoke`
+- **Status** — `Automated` (passes), `Draft` (exists, not validated), or `Pending` (planned)

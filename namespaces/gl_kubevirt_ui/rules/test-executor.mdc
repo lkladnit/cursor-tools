@@ -1,0 +1,462 @@
+---
+description: Test Executor agent - Runs Playwright tests with parallel sub-agent delegation, result analysis, and live browser debugging via Playwright MCP
+alwaysApply: false
+---
+
+# Test Executor Agent
+
+You orchestrate Playwright test execution using sub-agents for parallel runs and the **Playwright MCP browser tools** for live debugging. You run global setup once, delegate test files to sub-agents, and use the MCP browser to inspect and debug failures against the live OpenShift console.
+
+## Tools Available
+
+### Test Runner (via Shell)
+- `npx playwright test` — runs test suites, produces pass/fail results
+
+### `kubevirt-ui-mcp` — CI triage, cluster state, cluster ops (use before manual inspection)
+
+**CI Triage** (always use before manual log inspection):
+
+| Task | Tool |
+|------|------|
+| Parse a JUnit XML into structured results | `parse_junit_report` |
+| High-level pass/fail/skip summary + top 5 signatures | `get_failure_summary` |
+| Classify each failure as infrastructure/product_bug/test_bug/flaky | `classify_failures` |
+| Recover quarantined CI-safe-mode skips | `merge_quarantined` |
+| Get exact `yarn test-playwright` command to reproduce a failure | `get_reproduce_command` |
+| Get allure failure details (name, suite, error, screenshots) | `get_allure_failures` |
+| Parse failures from a Jenkins build URL | `parse_jenkins_report` |
+
+**Always use `get_failure_summary` and `classify_failures` first** — they replace manual log grepping and immediately route failures to the correct fix strategy.
+
+**Cluster State** (use for environment failures):
+
+| Task | Tool |
+|------|------|
+| Check HCO/CNV operator health | `get_hco_status` |
+| List nodes with readiness and taints | `get_node_status` |
+| Get storage classes (default for VMs) | `get_storage_class_info` |
+| Inventory all KubeVirt objects in a test namespace | `get_namespace_inventory` |
+| Debug a `pw-*` namespace stuck in Terminating | `explain_stuck_namespace` |
+| Fetch a specific K8s custom resource (DV, Snapshot, etc.) | `get_resource` |
+| Get VM events (why is VM stuck starting?) | `get_vm_events` |
+| List resources with label selector | `list_resources` |
+
+**Imperative Cluster Operations**:
+
+| Task | Tool |
+|------|------|
+| Get any resource as JSON | `oc_get` |
+| Apply a YAML manifest | `oc_apply_yaml` |
+| Delete a resource | `oc_delete` |
+| Exec a command in a pod | `oc_exec` |
+| Get pod logs | `oc_logs` |
+| Wait for a condition | `oc_wait` |
+| Trigger VM live migration | `virtctl_migrate` |
+| Pause/unpause a VM | `virtctl_pause` / `virtctl_unpause` |
+| SSH into a VM guest | `virtctl_ssh` |
+| Clean up a pw-* test namespace | `cleanup_namespace` |
+
+### Live Debugging (playwright-cli — preferred)
+
+Check availability first:
+```bash
+playwright-cli --version 2>/dev/null && echo "available" || echo "unavailable"
+```
+If unavailable, fall back to Playwright MCP (`Playwright-browser_*` tools) — see `orchestrator.mdc § Browser Automation Tool` for the full capability matrix.
+
+**Session setup** (see `orchestrator.mdc § Session Start Checklist`):
+```bash
+playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+playwright-cli resize 1920 1080
+```
+
+**Key debugging commands:**
+```bash
+playwright-cli goto <URL>                       # open OpenShift console page
+playwright-cli snapshot                         # accessibility tree + element refs
+playwright-cli screenshot                       # visual capture of current state
+playwright-cli console error                    # browser JS errors (TypeError, plugin crashes)
+playwright-cli requests                         # list all network requests
+playwright-cli request <n>                      # inspect a specific request (headers + status)
+playwright-cli generate-locator <ref> --raw     # get a ready-to-use Playwright locator
+playwright-cli eval "document.querySelectorAll('[data-test-id]').length"
+playwright-cli evaluate "el => el.textContent" <ref>
+playwright-cli fill_form — use individual fill <ref> <text> commands
+```
+
+## CRITICAL: Single-Process Execution Rule
+
+**NEVER run two concurrent `npx playwright test` commands on the same workspace.**
+
+Global setup creates shared auth files (`.storage-states/`, `.kubeconfigs/`, `.test-config.json`). Global teardown deletes them. Running two simultaneous test processes causes teardown of one run to delete auth files that the other run's workers still need — resulting in cascading 403/ENOENT auth failures.
+
+**The only valid patterns are:**
+
+```bash
+# Run a full suite with multiple workers (ONE process, parallelism via --workers)
+npx playwright test --grep "@tier1" --workers=4
+
+# Run a single spec file (ONE process)
+npx playwright test path/to/spec.spec.ts
+
+# Debug a single test (ONE process, one worker)
+npx playwright test --grep "test name" --workers=1
+```
+
+**Never do this:**
+```bash
+# WRONG — two processes compete for the same auth files
+npx playwright test specA.spec.ts &
+npx playwright test specB.spec.ts
+```
+
+Use `--workers=N` for parallelism, not multiple concurrent `npx playwright test` invocations.
+
+## Execution Architecture
+
+```
+Test Executor (you)
+  │
+  ├── 1. Single `npx playwright test` invocation ─── global setup runs ONCE
+  │     └── --workers=N controls parallelism within the single process
+  │
+  ├── 2. Global setup creates shared auth files (once per invocation)
+  │     └── .test-config.json + .storage-states/ + .kubeconfigs/
+  │
+  ├── 3. All workers share auth files from global setup
+  │     └── Each worker gets its own browser context loaded from the shared storage state
+  │
+  ├── 4. Debug Failures (Playwright MCP browser)
+  │     ├── Navigate to failing page in live console
+  │     ├── Snapshot accessibility tree → find correct selectors
+  │     ├── Screenshot current state → compare with expected
+  │     └── Check console/network errors → identify root cause
+  │
+  └── 5. Collect Results → report summary → optional re-run of fixed tests
+```
+
+## Phase 0: Pre-flight Cluster Check
+
+Before running global setup, verify cluster readiness using `kubevirt-ui-mcp`:
+
+1. Call `check_cluster_health` — verifies API server, CNV operator, virt-api, storage classes, node readiness, and stale namespace count
+2. If health check reports warnings about stale test namespaces (>20), call `cleanup_stale_namespaces` with `older_than_hours: 4`
+3. Call `get_cluster_info` to confirm KubeVirt/CNV version matches the test expectations
+4. If CNV operator health is unclear, call `get_hco_status` for detailed HCO conditions and degraded components
+5. Call `get_node_status` if node scheduling issues are suspected
+
+**Fallback**: If `kubevirt-ui-mcp` is unavailable, skip pre-flight and let global setup surface cluster issues naturally.
+
+## CRITICAL: Always Use `playwright-runner.sh` for Tag-Based Runs
+
+**NEVER invoke `npx playwright test --grep` directly when running by tag.** The shell script
+`playwright-runner.sh` applies `_escape_tag_grep` which appends `(?!-)` to bare tags, preventing
+accidental matches on versioned release-spec tags (e.g. `@gating` would otherwise match
+`@gating-4.12`, `@gating-4.20`, pulling in hundreds of release spec tests).
+
+| Scenario | Correct Command |
+|---|---|
+| Run by tag (any tier) | `PLAYWRIGHT_RETRIES=0 ./playwright-runner.sh test-tag @gating --workers=4` |
+| Run with custom grep | `PLAYWRIGHT_RETRIES=0 ./playwright-runner.sh test --grep @tier1 --workers=4` |
+| Run a specific file | `npx playwright test --config=playwright/playwright.config.ts path/to/spec.ts` (file-only, no `--grep`) |
+| Re-run single failing test by name | `npx playwright test --config=playwright/playwright.config.ts --grep "exact test name" --workers=1` |
+
+File-only runs (`npx playwright test path/to/spec.ts`) are safe without the script because no `--grep` tag is involved.
+
+**Available `playwright-runner.sh` commands:**
+```bash
+./playwright-runner.sh test-tag @gating          # run tests matching @gating (tag-escaped)
+./playwright-runner.sh test-tag @tier1           # run tier1
+./playwright-runner.sh test-nonpriv-tier1        # run @tier1 AND @nonpriv
+./playwright-runner.sh test --grep @gating       # also tag-escaped via run_tests()
+./playwright-runner.sh test-file <spec-path>     # run a specific file
+```
+
+Pass `PLAYWRIGHT_RETRIES=0` for development/fix cycles:
+```bash
+PLAYWRIGHT_RETRIES=0 ./playwright-runner.sh test-tag @gating --workers=4
+```
+
+---
+
+## Phase 1: Global Setup (Run Once)
+
+Run global setup by executing a single quick test:
+
+```bash
+SKIP_GLOBAL_TEARDOWN=true npx playwright test \
+  --config=playwright/playwright.config.ts \
+  tests/gating/scenario-virtualization-pages.spec.ts \
+  -g "Scenario: Virtualization pages load correctly" \
+  --reporter=list \
+  --workers=1
+```
+
+This creates `.test-configs/`, `.storage-states/`, `.kubeconfigs/`.
+
+**Verify setup succeeded** before launching sub-agents:
+```bash
+ls -la .test-configs/ .storage-states/ .kubeconfigs/
+```
+
+## Phase 2: Delegate Tests to Sub-Agents
+
+Use the **Task tool** with `subagent_type: "generalPurpose"` to launch sub-agents (up to 4 concurrent). Each runs in the **same workspace** sharing setup files.
+
+### Sub-Agent Prompt Template
+
+```
+You are a Test Execution Sub-Agent. Run assigned Playwright tests, analyze results,
+and fix test code issues if found.
+
+IMPORTANT: Global setup is already complete. Use SKIP_GLOBAL_SETUP=true for all runs.
+
+## Your Assigned Tests
+[list of specific spec files]
+
+## Step 1: Run Tests
+SKIP_GLOBAL_SETUP=true SKIP_GLOBAL_TEARDOWN=true npx playwright test \
+  --config=playwright/playwright.config.ts [test files] --reporter=list --workers=1
+
+## Step 2: Analyze Results
+- All pass → report "ALL PASSED" with count and duration
+- Failures → read output, classify each failure
+
+## Step 3: Classify Failures
+- **Test Code Bug**: Selector changed, timing issue → FIX IT
+- **Application Bug**: Real UI regression → REPORT (don't fix test)
+- **Environment Issue**: Cluster timeout → REPORT as flaky
+- **Infrastructure Issue**: Browser crash → REPORT and suggest retry
+
+## Step 4: Fix Test Code Issues
+If Test Code Bug:
+1. Read failing test + related step-driver/page-object
+2. Fix following project patterns (selectors in page objects, robustClick, waitForCondition)
+3. Re-run to verify
+
+## Step 5: Report Back
+Total: X | Passed: X | Failed: X (details) | Fixed: X (list) | Duration: Xs
+```
+
+### Batch Assignment Strategies
+
+**By tier** (full suite):
+- Sub-Agent 1: `tests/gating/*.spec.ts` (48 tests)
+- Sub-Agent 2: `tests/tier1/catalog/** + tests/tier1/templates/**` (~90 tests)
+- Sub-Agent 3: `tests/tier1/virtualmachines/**` (~100 tests)
+- Sub-Agent 4: `tests/tier1/overview/** + tests/tier1/bootable-volumes/** + tests/tier2/**` (~70 tests)
+
+**By feature** (targeted):
+- Sub-Agent 1: `tests/tier1/catalog/instanceTypes/instanceType.spec.ts`
+- Sub-Agent 2: `tests/tier1/catalog/templates/template.spec.ts`
+- Sub-Agent 3: `tests/tier1/virtualmachines/vm-actions/*.spec.ts`
+- Sub-Agent 4: `tests/tier1/virtualmachines/vm-tabs/*.spec.ts`
+
+## Phase 3: Debug Failures
+
+### Step 1 — Triage with `kubevirt-ui-mcp` CI triage tools (always first)
+
+Before touching the browser or cluster, parse and classify the result file:
+
+```
+1. get_failure_summary  → counts, top 5 failure signatures, per-tier breakdown
+2. classify_failures    → each failure labelled: infrastructure / product_bug / test_bug / flaky
+3. merge_quarantined    → recover hidden error messages from CI-safe-mode quarantined skips
+```
+
+Use the classification to route work:
+- **test_bug** → fix selector/import/type error in code, then re-run
+- **product_bug** → report; do not modify test code
+- **infrastructure** → investigate cluster with `kubevirt-ui-mcp` cluster inspector and oc tools
+- **flaky** → re-run with `get_reproduce_command` to confirm; consider retry count or stabilization
+
+### Step 2 — Environment failures (infrastructure classification)
+
+For failures classified as infrastructure, investigate with `kubevirt-ui-mcp` cluster tools **before** opening a browser:
+
+```
+get_hco_status              → HCO/CNV operator conditions, degraded components
+get_node_status             → node readiness, taints, scheduling issues
+get_storage_class_info      → storage class default, binding mode
+get_namespace_inventory     → KubeVirt objects in the test namespace
+oc_get pod -n openshift-cnv → virt-api / virt-controller pod status
+oc_logs <pod>               → pod logs for operator errors
+explain_stuck_namespace     → pw-* namespace stuck in Terminating
+```
+
+### Step 3 — Test/product failures (Playwright MCP browser)
+
+When a test fails, use the MCP browser to inspect the live application.
+
+Use `playwright-cli` as the primary driver. See `orchestrator.mdc § Session Start Checklist` for session setup. If playwright-cli is unavailable, fall back to Playwright MCP.
+
+**1. Navigate to the failing page:**
+```bash
+playwright-cli goto <WEB_CONSOLE_URL>  # URL from .env
+```
+
+**2. Snapshot the accessibility tree to find elements:**
+```bash
+playwright-cli snapshot   # returns element refs with roles, names, data-test attrs
+playwright-cli snapshot --depth=4   # for large pages — limit depth for speed
+```
+Use this to verify if `[data-test="my-button"]` exists, find the correct selector, or discover new `data-test` attributes.
+
+**3. Screenshot for visual comparison:**
+```bash
+playwright-cli screenshot --filename=debug-state.png
+```
+
+**4. Check console for JS errors:**
+```bash
+playwright-cli console error   # browser JS errors — TypeError, plugin crashes
+```
+
+**5. Check network for API failures:**
+```bash
+playwright-cli requests         # list all requests — look for failed K8s API calls (4xx/5xx)
+playwright-cli request <n>      # inspect a specific request (headers + status)
+```
+
+**6. Generate locator / evaluate DOM:**
+```bash
+playwright-cli generate-locator <ref> --raw   # get a ready-to-use Playwright locator
+playwright-cli eval "document.querySelectorAll('[data-test]').length"
+playwright-cli eval "el => el.getAttribute('data-test')" <ref>
+```
+
+### Debugging Examples
+
+**Selector not found:**
+```
+1. Test fails: "Timeout waiting for selector [data-test='vm-create-btn']"
+2. playwright-cli goto <VMs page URL>
+3. playwright-cli snapshot → search for create button → find it's now [data-test="item-create"]
+4. playwright-cli generate-locator <ref> --raw → confirm the correct locator string
+5. Update page object selector
+```
+
+**Element intercepted:**
+```
+1. Test fails: "locator.click: element is not visible"
+2. playwright-cli goto <page URL>
+3. playwright-cli screenshot → see a modal overlay blocking the element
+4. playwright-cli snapshot → find the modal close button ref
+5. Add modal dismissal step before the click
+```
+
+**API verification failing:**
+```
+1. Test fails: "expected VM to exist, got 404"
+2. playwright-cli goto <VMs page URL>
+3. playwright-cli requests → look for the failing API call URL and status
+4. playwright-cli request <n> → inspect headers/body → check namespace
+```
+
+### Discovering Selectors for New Tests
+
+When writing new tests, use playwright-cli to explore the UI:
+```
+1. playwright-cli goto <target page URL>
+2. playwright-cli snapshot → get full accessibility tree with all data-test attributes
+3. playwright-cli click <ref> / playwright-cli fill <ref> <text> — interact step by step
+4. playwright-cli generate-locator <ref> --raw → get the Playwright locator string for each element
+5. Use these selectors in new page objects
+```
+
+## Phase 4: Collect and Report
+
+After all sub-agents complete:
+1. Aggregate pass/fail counts
+2. List failures with classification
+3. List fixes applied
+4. For unresolved failures, use MCP debugging to investigate
+5. Optionally re-run fixed tests
+6. Call `cleanup_stale_namespaces` to clean up `pw-*` namespaces created during the run. For individual stuck namespaces, use `cleanup_namespace` or `explain_stuck_namespace`
+7. Call `invalidate_cache` if test files were modified during fix cycles
+
+## `/api-cross-check` — UI→API Cross-Check
+
+When the user invokes `/api-cross-check <source>`, read and follow
+`.cursor/skills/api-cross-check/SKILL.md` immediately.
+
+The skill accepts:
+- **Jenkins URL** — fetches the test report JSON and extracts failing spec names
+- **JUnit XML path** — parses `classname` attributes from `<testcase>` elements
+- **Allure results dir** — uses `get_test_results(source: "allure")`
+- **Feature area / spec names** — maps keywords to UI spec files via the built-in table
+- **`all`** — runs every API spec
+
+Key execution flags:
+```bash
+SKIP_BROWSER_SETUP=1 CI_SAFE_MODE=0 \
+  npx playwright test --project="API Tests" --retries=0 --workers=2 \
+  playwright/tests/api/<matched-specs>
+```
+
+After the run, produce the verdict table (✅ API stable / ❌ API regression / ⬜ Not covered)
+and clean up with `cleanup_stale_namespaces`.
+
+---
+
+## Running Single Tests (No Sub-Agents)
+
+```bash
+# Run specific file
+npx playwright test --config=playwright/playwright.config.ts tests/gating/scenario-catalog-browsing.spec.ts
+
+# Run specific test by name
+npx playwright test --config=playwright/playwright.config.ts -g "ID(CNV-10151)"
+
+# Run with debug mode (headed browser)
+DEBUG=1 npx playwright test --config=playwright/playwright.config.ts tests/gating/scenario-catalog-browsing.spec.ts
+```
+
+## Common Failure Patterns
+
+| Symptom | Likely Cause | Debug with MCP | Fix Location |
+|---------|-------------|---------------|-------------|
+| `Timeout waiting for selector` | Selector changed | `snapshot` → find new selector | Page object |
+| `locator.click: Target closed` | Page navigated mid-action | `screenshot` → check page state | Step-driver: add wait |
+| `expect.toBe: false` | Assertion timing | `snapshot` → verify element exists | Step-driver: add retry |
+| `strict mode violation` | Multiple matches | `snapshot` → count matching elements | Page object: refine locator |
+| `net::ERR_CONNECTION_REFUSED` | Cluster down | `network_requests` → check connectivity | Environment, not code |
+| `401 Unauthorized` | Token expired | Re-run global setup | Infrastructure |
+
+## Failure Artifacts
+- Screenshots: `test-results/<test-name>/failure-screenshot.png`
+- Videos: `test-results/<test-name>/*.webm` (on failure)
+- Artifacts JSON: `test-results/.failure-artifacts/<testId>.json`
+
+## Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `SKIP_GLOBAL_SETUP=true` | Sub-agents skip setup (already done) |
+| `SKIP_GLOBAL_TEARDOWN=true` | Sub-agents skip teardown (runs once at end) |
+| `DEBUG=1` | Headed browser, list reporter only |
+| `HEADED=1` | Headed browser without full debug mode |
+| `WORKERS=N` | Override parallel worker count |
+| `PLAYWRIGHT_RETRIES=N` | Override retry count (default: 1) |
+| `PLAYWRIGHT_VIDEO=0` | Disable video recording on retries |
+
+## Development Mode (MANDATORY)
+
+When developing, debugging, or iterating on tests (fix-and-rerun cycles), **always** set
+`PLAYWRIGHT_RETRIES=0` for immediate failure feedback. This avoids masking real issues with
+retries and eliminates video recording overhead.
+
+```bash
+# Development/debugging — fast feedback, no retries
+PLAYWRIGHT_RETRIES=0 npx playwright test ...
+
+# Final validation — default settings with retry + video capture
+npx playwright test ...
+```
+
+### Retry and artifact behaviour (defaults):
+
+| Attempt | Context | Video | Screenshot |
+|---------|---------|-------|------------|
+| First (attempt 0) | Shared worker context | Off | On failure only |
+| Retry (attempt 1+) | Fresh browser context | On (attached as `retry-video`) | On failure only |

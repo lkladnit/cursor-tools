@@ -1,0 +1,521 @@
+---
+description: Test Automation Orchestrator - Routes tasks to specialized agent roles for Playwright test creation, maintenance, and review
+alwaysApply: true
+---
+
+# Test Automation Orchestrator
+
+You coordinate specialized roles for the kubevirt-ui E2E test suite:
+- **Playwright** (primary): tests across spec files, 30+ PageObjects, 15 DataFactories, per-folder fixtures. No step driver layer — tests call Page Objects and clients directly.
+- **Release Specs** (`playwright/tests/releases/`): one Playwright spec per CNV release (4.12–4.21), maintained against the live cluster. These are already fully migrated and are the canonical source of truth.
+
+## Role Routing
+
+| Intent | Role | Rule |
+|-----|---|---|
+| Framework design, component gaps, tier placement, locator strategy, architectural policies | **QA Architect** | `qa-architect.mdc` |
+| Feature requirements, user stories, acceptance criteria, test scenarios, Jira ticket extraction, STD documents | **Business Analyst** | `business-analyst.mdc` |
+| Review code, refactoring, pattern compliance, PR feedback | **Code Reviewer** | `code-reviewer.mdc` |
+| Write tests, page objects, per-folder fixtures, factories, K8s client, navigation, test isolation | **Automation Implementer** | `automation-implementer.mdc` |
+| CI/CD, config, env setup, Playwright config, fixtures | **Infrastructure Handler** | `infrastructure-handler.mdc` |
+| Run tests, analyze results, debug failures, fix broken tests | **Test Executor** | `test-executor.mdc` |
+| Given a UI test report, run the matching API tests to validate HTTP endpoint stability | **API Cross-Check** | `.cursor/skills/api-cross-check/SKILL.md` |
+| Git cleanup, squash commits, pre-commit artifact removal | **Git Handler** | `git-handler.mdc` |
+| Explore live UI via MCP, discover untested features, cross-reference Jira tickets | **CNV Explorer** | `cnv-exploration.mdc` |
+| Replay test-mapped workflows via MCP, find bugs, cross-reference Jira for existing reports | **Bug Hunter** | `bug-hunter.mdc` |
+| Validate Jira ticket features/bugfixes on live UI via MCP, capture evidence screenshots, produce STD drafts | **MCP Tester** | `mcp-tester.mdc` |
+| Remove unused imports/methods/tests, eliminate duplication, enforce conventions, produce cleanup report | **Code Cleanup** | `code-cleanup.mdc` |
+| Write, run, update, or debug visual regression tests in `playwright/tests/visual/`; manage mock payloads, baselines, and `VisualMockPage` | **Visual Regression Handler** | `visual-regression-handler.mdc` |
+| Cross-reference product docs with active Jira tickets, surface limitations, risks, coverage gaps, and concerns | **Product Analyst** | `product-analyst.mdc` |
+
+### MCP Tester vs CNV Explorer vs Bug Hunter — Role Boundary
+
+The **MCP Tester** answers: *"Does this specific Jira ticket's feature/fix work correctly in the live UI?"*
+- Validates a single ticket's feature through structured manual testing
+- Captures numbered evidence screenshots at each validation point
+- Produces a validation report + STD draft as input for test automation
+- Read-only (code) — only writes to the gitignored `playwright/mcp-validations/` folder
+
+The **CNV Explorer** answers: *"What features exist in this module that lack test coverage?"*
+- Broad module-level exploration to discover untested features
+- Cross-references with Jira to find matching work items
+- Produces a coverage gap report, not per-ticket validation evidence
+
+The **Bug Hunter** answers: *"Are there bugs in the existing test-covered workflows?"*
+- Replays workflows from existing test cases looking for defects
+- Documents issues and cross-references with Jira
+- Does not validate new features — focuses on finding regressions
+
+### Product Analyst vs Business Analyst vs CNV Explorer — Role Boundary
+
+The **Product Analyst** answers: *"What risks and limitations does product documentation reveal about active development?"*
+- Cross-references official docs with active Jira tickets to find gaps and risks
+- Focuses on documented limitations, setup complexity, and cross-cutting concerns
+- Produces a prioritized risk report — does not design test scenarios or explore live UI
+- Read-only — only writes to the gitignored `playwright/product-analysis/` folder
+
+The **Business Analyst** answers: *"What scenarios should we test for this feature/ticket?"*
+- Takes a known feature and translates it into concrete test scenarios
+- Assumes the feature is understood — focuses on *how* to test it
+
+The **CNV Explorer** answers: *"What features exist in the live UI that lack test coverage?"*
+- Explores the actual running UI to find untested elements
+- Produces a gap report based on what the UI *currently shows*
+
+### Business Analyst vs QA Architect — Role Boundary
+
+The **Business Analyst** answers: *"What scenarios should we test?"*
+- Translates features/tickets into testable scenarios with steps, assertions, and cleanup
+- Defines preconditions, user personas, data fixtures, skip guards
+- Produces scenario design documents referencing existing Page Object methods
+
+The **QA Architect** answers: *"What framework components do we need to support those scenarios?"*
+- Identifies missing page object methods, locators, data factories
+- Designs new component structure (new PO, per-folder fixture, client method) when needed
+- Decides tier placement based on technical constraints (duration, parallelism, CI budget)
+- Enforces architectural policies (layering, page encapsulation, navigation)
+
+## Multi-Role Workflows
+
+For complex tasks, chain roles in order:
+
+1. **New feature testing**: Business Analyst (scenarios + Jira extraction) → QA Architect (framework gaps + tier) → Automation Implementer (code) → Code Reviewer → Business Analyst (STD update)
+2. **Test maintenance**: Code Reviewer (assess) → Automation Implementer (fix) → Code Reviewer (verify)
+3. **Coverage expansion**: Business Analyst (new scenarios) → QA Architect (framework gaps) → Automation Implementer (code) → Business Analyst (STD docs)
+4. **Test execution with auto-fix**: Test Executor (run + analyze) → Automation Implementer (fix) → Test Executor (re-run)
+5. **Full CI cycle**: Test Executor (run all) → Code Reviewer (review fixes) → QA Architect (framework health)
+6. **Framework extension**: QA Architect (gap analysis) → Automation Implementer (add missing PO methods / new fixture) → Code Reviewer
+7. **Coverage discovery (read-only)**: CNV Explorer (UI exploration + Jira search) → Gap Report
+8. **Coverage discovery + implement**: CNV Explorer (UI exploration + Jira search + gap report + routing + tier placement + plan) → user approval → Automation Implementer (code changes for approved tickets)
+9. **Focused debugging**: Test Executor (reproduce + MCP inspect + diagnose) → Automation Implementer (fix) → Test Executor (verify 3x)
+10. **Clean commit**: Git Handler (cleanup artifacts + squash + commit) → optional push
+11. **Bug hunting**: Bug Hunter (replay test workflows via MCP + find issues + Jira cross-reference) → Bug Hunt Report
+12. **Bug hunt + fix tests**: Bug Hunter (report) → Automation Implementer (update tests for confirmed app changes) → Code Reviewer
+13. **Code cleanup**: Code Cleanup (analyze + fix + validate + report) → optional Git Handler (commit)
+14. **Post-implementation cleanup**: Automation Implementer (new code) → Code Cleanup (remove dead code from old impl) → Code Reviewer
+15. **Validated test implementation**: MCP Tester (live UI validation + evidence + STD draft) → `/jira-task --validated` (skips MCP exploration, uses pre-validated data)
+16. **Pre-validation + implementation**: MCP Tester (validate ticket) → user reviews evidence → Automation Implementer (implement using validation report) → Code Reviewer
+17. **UI→API cross-check** (`/api-cross-check <source>`): API Cross-Check skill (parse report → resolve affected UI specs → map to API specs → run API Tests project → verdict report). Source can be a Jenkins URL, JUnit XML, Allure dir, feature names, or `all`.
+18. **Release spec bulk fix** (`/release-spec --all`): Release Spec Handler runs all 10 specs, triages failures by release, applies MCP-guided fixes per release file, re-runs to confirm.
+19. **Scaffold-first implementation** (`/jira-task <TICKET> --scaffold`): Business Analyst (scenarios) → QA Architect (gap analysis) → Automation Implementer (compilable stubs only — no step logic) → developer extends stubs manually.
+20. **Live exploration before commit** (`/jira-task <TICKET> --explore`): playwright-cli session (CRUD replay + network capture + video + trace) → exploration report in `playwright/mcp-validations/<TICKET>/explore/`. No framework output. Use as input for `--validated` or `--scaffold` follow-up.
+21. **CRUD + API coverage sweep** (`/cnv-exploration <module>` or `/bug-hunt <module>`): All CRUD operations for the module are a **primary directive** — exercise Create/Read/Update/Delete, capture network requests after each mutation, record endpoints + status codes in the Feature Map / Interaction Plan. API gaps (CRUD with UI coverage but no `playwright/tests/api/` counterpart) are flagged for `/api-cross-check`.
+22. **Add visual regression coverage for a module** (`/visual-regression add <module>`): Visual Regression Handler (add mock payload → add `VisualMockPage` method → add spec → run `--update-snapshots` → commit baselines).
+23. **Update visual baselines after intentional UI change** (`/visual-regression update [module]`): Visual Regression Handler (run `--project=VisualRegression` to see failing tests → inspect diffs → run `--update-snapshots` for confirmed intentional changes only → commit updated PNGs).
+24. **Debug visual regression failure** (`/visual-regression debug <spec>`): Visual Regression Handler (run failing spec → inspect diff PNG → check if mock payload is stale → check if selector changed → fix mock or selector → re-run to confirm) → optional Code Reviewer.
+25. **Full visual baseline refresh** (`/visual-regression refresh`): Visual Regression Handler (run `--project=VisualRegression --update-snapshots` for all specs → review every changed PNG → commit).
+26. **General QE development** (`/qe-dev <prompt>`): Free-form prompt → intent classification → MCP context gathering → structured plan (presented for approval) → role-sequenced implementation. Handles any combination of: new tests, expand existing, fix/stabilize, visual regression, code cleanup, framework changes, exploration, debugging, live validation. See `.cursor/commands/qe-dev.md` for full spec.
+27. **Product documentation risk analysis** (`/product-analysis [--focus <area>]`): Product Analyst (fetch docs + fetch active Jira tickets → cross-reference → risk score → top 10 report). Output: `playwright/product-analysis/report-YYYY-MM-DD.md`. Read-only — no code changes.
+28. **Product analysis + coverage action** (`/product-analysis` → user selects findings): Product Analyst (report) → user picks high-priority findings → Business Analyst (design scenarios for selected risks) → QA Architect (framework gaps) → Automation Implementer (implement coverage).
+29. **Ticket lifecycle checklist** (`/ticket-lifecycle <TICKET>`): Product Analyst (version matrix + clone verification + build lookup via CNV Version Explorer) → process checklist output. Read-only — produces `playwright/product-analysis/ticket-lifecycle-<TICKET>.md` with action items, per-version validation steps, and a Jira comment template.
+30. **Ticket lifecycle + coverage** (`/ticket-lifecycle <TICKET> --coverage`): Same as #29, plus framework coverage check via `find_tests_by_jira` + `get_coverage_for_feature` — shows what existing tests cover and what gaps remain.
+
+## Project Architecture (Required Context)
+
+All roles must operate within this layered architecture:
+
+```
+Tests (.spec.ts) → import from per-folder fixture (e.g. vm-tabs-fixture.ts)
+ ↓
+PageObjects (src/page-objects/) → extend BasePage or PageCommons; own ALL locators and page interactions
+ ↓
+Clients (src/clients/) → KubernetesClient (facade → handlers), OcCliClient, VirtctlClient, RequestContextClient
+```
+
+Per-folder fixtures live in `playwright/src/fixtures/` and extend `baseTest` from `scenario-test-fixture.ts` to inject the Page Objects and clients needed by a test group. There is no step driver layer.
+
+State is explicit: resource names are local variables, passed directly to PO/client methods. `ScenarioContextManager` (via `ContextKey`) is still available through base classes for cross-method state when needed. Configuration flows from `.env` → `global.setup.ts` (rule engine) → `.test-config.json` → `TestConfigManager` → `testConfig` fixture.
+
+### Visual Regression Specs Architecture (`playwright/tests/visual/`)
+
+Visual regression specs detect pixel-level layout changes across CNV versions. They run under the `Visual` Playwright project and use deterministic API mocks — no cluster resources are created.
+
+```
+playwright/tests/visual/visual-<module>.spec.ts
+  → imports test/expect from @/fixtures/visual-fixture
+  → calls visualMockPage.mock<Resource>Api() BEFORE navigation
+  → navigates via existing PO *ViaUI() methods
+  → calls visualMockPage.waitForPageSettle()
+  → asserts with toHaveScreenshot('<element>.png', { animations: 'disabled', mask: [...] })
+  → VisualMockPage.clearAllMocks() called automatically in fixture teardown
+```
+
+Key components:
+- `VisualMockPage` (`src/page-objects/visual/visual-mock-page.ts`) — owns ALL `page.route()` intercepts; never call `page.route()` in spec files
+- `visual-mock-data.ts` (`src/utils/visual-mock-data.ts`) — single source of truth for all deterministic mock payloads
+- `visual-fixture.ts` (`src/fixtures/visual-fixture.ts`) — wires `VisualMockPage` + all module page objects
+- Baselines stored in `playwright/tests/visual/__screenshots__/` and committed to git
+
+Run: `npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression`
+Update baselines: add `--update-snapshots` flag (only for intentional UI changes)
+
+### Release Specs Architecture (`playwright/tests/releases/`)
+
+Release specs are standalone procedural files — no Page Objects, no per-folder fixtures, no Allure metadata.
+
+```
+playwright/tests/releases/release-4.XX.spec.ts
+  → imports test/expect from @/fixtures/releases-fixture
+  → uses page.locator() / page.getByTestId() directly
+  → inline async helper functions (no external helpers)
+  → constants and selectors declared at file top
+```
+
+One file per CNV release (4.12–4.21). Tags are release-versioned (`@release-4.XX`, `@gating-4.XX`, `@tier1-4.XX`, etc.) to prevent collision with mainline tests. The source of truth is the spec file itself — there is no Cypress branch to sync against.
+
+## Branch Naming Convention
+
+When creating branches for test work:
+
+1. **Resolve the username** from the git email prefix: `git config user.email | cut -d@ -f1` (e.g., `bmaio`)
+2. **Apply the naming convention:**
+   - **Single Jira ticket:** `<username>/<jira-key-lowercase>-test` (e.g., `bmaio/cnv-78882-test`)
+   - **Multiple Jira tickets:** `<username>/test-automation-<first-jira-key-lowercase>` (e.g., `bmaio/test-automation-cnv-78882`)
+   - **Release spec update:** `<username>/release-4.XX-update`
+
+## `kubevirt-ui-mcp` — Unified MCP (ALL Roles)
+
+**One custom MCP server for everything.** Two MCP entries are configured in `.cursor/mcp.json`:
+
+1. **`kubevirt-ui-mcp`** — unified Rust binary (`$KUBEVIRT_UI_MCP_DIR/target/release/kubevirt-ui-mcp`), 75 tools across 8 domains. Requires `KUBEVIRT_UI_MCP_DIR` to be set before launching Cursor.
+2. **`Playwright`** — browser automation (fallback when `playwright-cli` is unavailable)
+
+**This is the primary tool for every task.** Every role must check `kubevirt-ui-mcp` before falling back to any manual approach (grep, Read file, Shell commands). Even for prompts with no explicit command, always consider whether a `kubevirt-ui-mcp` tool can answer the question faster and more accurately than reading files directly.
+
+### Tool Domains and When to Use Them
+
+#### Coverage — test oracle, scaffolding, cluster, GitHub
+
+| Tool | Use |
+|---|---|
+| `get_coverage_for_feature` | Find spec files, page objects, STD docs covering a feature |
+| `find_tests_by_jira` | Which specs cover a given Jira ticket |
+| `get_orphan_page_object_methods` | Public PO methods never used — dead code candidates |
+| `get_tier_distribution` | Test counts per tier with Jira IDs |
+| `invalidate_cache` | Clear scanner cache after modifying spec/PO files |
+| `get_cluster_info` | KubeVirt/CNV/CDI/K8s versions |
+| `list_vms` | VMs in a namespace with status and run strategy |
+| `get_vm_detail` | Full VM spec, conditions, VMI runtime info |
+| `list_test_namespaces` | `pw-*` namespaces with age and status |
+| `cleanup_stale_namespaces` | Delete `pw-*` namespaces older than N hours |
+| `check_cluster_health` | Pre-flight: API server, CNV, virt-api, storage, nodes |
+| `scaffold_test` | `.spec.ts` skeleton (returns content, does NOT write to disk) |
+| `scaffold_page_object` | Page object skeleton (returns content, does NOT write) |
+| `scaffold_std` | STD markdown document skeleton (returns content, does NOT write) |
+| `run_tests` | Execute `yarn test-playwright` with structured params; use `dry_run` to preview |
+| `get_test_results` | Parse latest JUnit XML or Allure results |
+| `get_pr_details` | PR metadata, files changed, CI check status |
+| `get_pr_files_coverage` | Cross-reference PR files with spec/PO coverage |
+| `get_pr_comments` | PR review and issue comments |
+| `list_open_prs` | Open PRs with author/label filter |
+| `search_prs` | Search PRs by keyword |
+
+#### Context — token-efficient AST views of the framework
+
+The context tools are **mandatory** before reading any large TypeScript file. The AST index builds in ~180ms at startup and auto-refreshes on file changes.
+
+| Tool | Use | Token savings |
+|---|---|---|
+| `get_class_surface` | Public methods + JSDoc for any class | ~4–20× |
+| `get_fixture_api` | Compressed interface of `scenario-test-fixture.ts` | ~20× |
+| `get_task_context` | Relevant methods + imports for a task description | — |
+| `get_selector_map` | All `data-test`/`data-test-id`/ARIA selectors in a PO | — |
+| `get_import_guide` | Correct `@/` import paths for named symbols | — |
+| `get_base_patterns` | Code skeleton for test, PO, step driver, API test | — |
+| `search_methods` | Keyword search across all PO + step driver methods | — |
+| `refresh_index` | Force AST index rebuild after bulk file changes | — |
+
+**Never read these files directly:**
+
+| File | Use instead |
+|---|---|
+| `virtual-machines-page.ts` (~4,800 lines) | `get_class_surface("VirtualMachinesPage")` |
+| `virtual-machine-detail-page.ts` (~4,000 lines) | `get_class_surface("VirtualMachineDetailPage")` |
+| `catalog-page.ts` (~3,300 lines) | `get_class_surface("CatalogPage")` |
+| `page-commons.ts` (~1,298 lines) | `get_class_surface("PageCommons")` |
+| `scenario-test-fixture.ts` (~1,200 lines) | `get_fixture_api()` |
+| `kubernetes-client.ts` (~3,200 lines) | `get_class_surface("KubernetesClient")` |
+| `vm-handler.ts` (~2,200 lines) | `get_class_surface("VirtualMachineHandler")` |
+| `oc-cli-client.ts` (~1,200 lines) | `get_class_surface("OcCliClient")` |
+| `request-context-client.ts` (~565 lines) | `get_class_surface("RequestContextClient")` |
+
+#### Spec — STD documents and spec file metadata
+
+| Tool | Use |
+|---|---|
+| `list_std_docs` | List STD documents, optionally filtered by tier or feature |
+| `get_std_doc` | STD content + spec metadata (Jira IDs, tags, skip status) |
+| `get_all_specs_markdown` | All STDs for a tier/feature in one document |
+| `list_spec_files` | Spec files annotated with `✅ STD` / `⚠ no STD` |
+| `get_spec_markdown` | STD for a specific spec file (falls back to spec metadata) |
+| `search_tests` | Search by Jira ID, keyword, or tag |
+
+**Roles that must use this**: Business Analyst, QA Architect, Code Reviewer, Automation Implementer.
+
+#### Memory — Jira ticket cache
+
+Pre-indexed CNV Jira tickets and kubevirt-plugin commit history. Use before reaching for `curl`.
+
+| Tool | Use |
+|---|---|
+| `get_ticket` | Full cached record: summary, status, labels, commits |
+| `search_tickets` | Full-text search across all cached tickets |
+| `list_tickets` | Compact list for backlog browsing |
+| `refresh_store` | Re-fetch commits and refresh stale Jira data |
+
+**Roles that must use this**: Business Analyst (ticket extraction), MCP Tester (Phase 0), Bug Hunter (Jira cross-reference), CNV Explorer (Phase 3).
+
+#### CI Triage — parse and classify test run failures
+
+| Tool | Use |
+|---|---|
+| `parse_junit_report` | Parse JUnit XML into structured test results |
+| `parse_jenkins_report` | Fetch and parse a Jenkins build test report |
+| `merge_quarantined` | Recover error messages from CI-safe-mode quarantined skips |
+| `classify_failures` | Label each failure: `infrastructure` / `product_bug` / `test_bug` / `flaky` |
+| `get_reproduce_command` | Exact `yarn test-playwright` command to reproduce a failure |
+| `get_allure_failures` | Allure failure details with screenshots/videos |
+| `get_failure_summary` | Pass/fail/skip counts, top 5 signatures, per-tier breakdown |
+
+**Role that must use this**: Test Executor — always run `get_failure_summary` + `classify_failures` before manual triage.
+
+#### Cluster Inspector — deep KubeVirt cluster state (no `kubectl` required)
+
+| Tool | Use |
+|---|---|
+| `get_resource` | Fetch a specific CRD instance (DV, Snapshot, HCO, MigrationPolicy…) |
+| `list_resources` | List resources with label selector |
+| `get_hco_status` | HCO/CNV operator conditions, feature gates, degraded components |
+| `get_vm_events` | VM or VMI events for stuck/failing resources |
+| `get_storage_class_info` | Storage classes, default for VMs, binding mode |
+| `get_node_status` | Node readiness, roles, capacity, taints |
+| `get_namespace_inventory` | All KubeVirt objects in a `pw-*` test namespace |
+| `explain_stuck_namespace` | Why a `pw-*` namespace is stuck in Terminating |
+
+**Roles that must use this**: Test Executor (Phase 0 + infrastructure failures), Infrastructure Handler, MCP Tester (Phase 0), Bug Hunter.
+
+#### OC / virtctl — imperative cluster operations
+
+Wraps `oc` CLI and `virtctl` without shell injection risk.
+
+| Tool | Use |
+|---|---|
+| `oc_get` | Get any K8s resource as JSON |
+| `oc_apply_yaml` | Apply a YAML manifest |
+| `oc_delete` | Delete a resource |
+| `oc_wait` | Wait for a condition |
+| `oc_logs` | Pod logs (last N lines) |
+| `oc_exec` | Exec a command in a pod |
+| `virtctl_migrate` | Trigger VM live migration |
+| `virtctl_pause` / `virtctl_unpause` | Pause or unpause a VMI |
+| `virtctl_ssh` | Run a command in a VM guest via SSH |
+| `cleanup_namespace` | Delete all KubeVirt objects in a `pw-*` namespace |
+
+**Roles that must use this**: Test Executor (pod logs, namespace cleanup), Infrastructure Handler, Bug Hunter.
+
+#### Linter — spec conventions and framework metadata
+
+| Tool | Use |
+|---|---|
+| `lint_spec_file` | Check a spec for raw `page`, hardcoded timeouts, missing `cleanup.track`, missing IDs |
+| `validate_std_coverage` | Jira IDs in specs missing from STD docs |
+| `check_api_ui_parity` | UI specs with write ops that lack API spec counterparts |
+| `get_allure_suite_map` | Authoritative feature area → Allure Epic/Feature/Story mapping |
+| `get_env_vars` | All env vars with type, default, required flag |
+| `get_fixture_map` | Which fixture file each test folder imports |
+| `get_setup_rules` | Global setup rule IDs, phases, descriptions |
+| `get_teardown_rules` | Teardown rule IDs and cleanup targets |
+
+**Roles that must use this**: Automation Implementer (`lint_spec_file` after every spec), Code Reviewer, QA Architect.
+
+### MCP-First, Fallback-Second
+
+Every role must try `kubevirt-ui-mcp` first. Fallback to manual approaches (grep, Read, Shell) is only permitted when the MCP tool returns an error or explicitly returns no results.
+
+**The `context-proxy.mdc` rule governs all `playwright/src/` file access — read it.**
+
+| Task | Tool | Fallback (MCP error/no result only) |
+|---|---|---|
+| Read any page object or client | `get_class_surface` | Read file directly |
+| Search for a method across classes | `search_methods` | `rg "methodName" playwright/src/` |
+| Find selectors in a page object | `get_selector_map` | `rg "data-test" <file>` |
+| Read the test fixture interface | `get_fixture_api` | Read `scenario-test-fixture.ts` |
+| Find correct import paths | `get_import_guide` | Search barrel files manually |
+| Get context for an implementation task | `get_task_context` | Read multiple files individually |
+| Find tests covering a feature | `get_coverage_for_feature` | `rg "<feature>" playwright/tests/ -l` |
+| Find tests by Jira ticket | `find_tests_by_jira` | `rg "CNV-XXXXX" playwright/tests/ playwright/docs/` |
+| Find orphan page object methods | `get_orphan_page_object_methods` | Manual method-by-method grep |
+| Tier breakdown | `get_tier_distribution` | Manual file counting |
+| Pre-flight cluster check | `check_cluster_health` | `get_hco_status` directly |
+| Deep cluster state (HCO, nodes, DVs) | `get_hco_status` / `get_node_status` / `get_resource` | `oc describe` via Shell |
+| Imperative cluster ops | `oc_get` / `oc_apply_yaml` / `oc_logs` | Shell `oc` commands |
+| Clean stale test namespaces | `cleanup_stale_namespaces` | `cleanup_namespace` |
+| Scaffold new spec/PO/STD | `scaffold_test` / `scaffold_page_object` / `scaffold_std` | Copy from existing files |
+| Fetch a Jira ticket | `get_ticket` | `curl` Jira REST API |
+| Search Jira tickets by keyword | `search_tickets` | Jira JQL via `curl` |
+| Parse CI test results | `get_failure_summary` + `classify_failures` | Manual log reading |
+| Reproduce a CI failure | `get_reproduce_command` | Manual test grep |
+| Lint a spec file | `lint_spec_file` | Manual checklist from `code-reviewer.mdc` |
+| Check API/UI parity | `check_api_ui_parity` | Manual comparison |
+| Get allure tag constants | `get_allure_suite_map` | Read `allure-constants.ts` |
+| Get env vars reference | `get_env_vars` | Read `env-variables.ts` |
+| Get fixture map | `get_fixture_map` | Read `CLAUDE.md` fixture table |
+| Read an STD document | `get_std_doc` | Read from `playwright/docs/` |
+| List STDs by tier/feature | `list_std_docs` | `ls playwright/docs/` |
+| Search tests by Jira ID, keyword, or tag | `search_tests` | `rg "CNV-XXXXX" playwright/docs/ playwright/tests/` |
+| Check STD coverage for a spec file | `list_spec_files` | Manual cross-reference |
+
+### Cache Invalidation
+
+- After modifying test files, page objects, or fixtures → call `invalidate_cache` (once per batch of changes, not after every edit)
+- The context AST index auto-refreshes on file changes → call `refresh_index` only after bulk changes the watcher may have missed
+
+## Coordination Rules
+
+- Always identify which role(s) a request needs before starting work
+- When multiple roles are needed, complete each role's output before switching
+- Clearly state which role you are operating as when switching
+- Every role must check existing implementations before creating new components
+- Reference real file paths, class names, and method names from the codebase
+
+## Memory Bank Protocol (ALL Roles)
+
+The memory bank is a persistent knowledge graph maintained in a **separate external repository**:
+
+**→ https://github.com/bmaio-redhat/kubevirt-memory**
+
+Do **not** store memory bank files in this repository. See `memory-bank.mdc` for the full protocol.
+
+**Quick protocol:**
+1. **Before work** — read `/home/bmaio/Developer/Projects/kubevirt-memory/index.md`, then read nodes relevant to the current task
+2. **After work** — write/update relevant nodes at the local path; commit and push to the external repo
+3. **Never add** cluster credentials, tokens, passwords, URLs, or `.env` values
+
+## Browser Automation Tool (ALL Browser-Using Roles)
+
+Roles that interact with a live browser — MCP Tester, Bug Hunter, CNV Explorer — have two drivers available. Use the right one for the task:
+
+### Capability Matrix
+
+| Task | `playwright-cli` | Playwright MCP | Preferred |
+|------|-----------------|----------------|-----------|
+| Navigation + snapshots (accessibility tree) | ✓ `goto` + `snapshot` | ✓ `browser_navigate` + `browser_snapshot` | Either |
+| Partial snapshot for large pages | ✓ `snapshot --depth=N` or `snapshot <ref>` | ✗ not available | **playwright-cli** |
+| Pipe-friendly snapshot output | ✓ `--raw snapshot > file.yml` | ✗ not available | **playwright-cli** |
+| Screenshot capture | ✓ `screenshot --filename=` | ✓ `browser_take_screenshot` | Either |
+| Click / fill / select | ✓ `click` / `fill` / `select` | ✓ `browser_click` / `browser_type` / `browser_fill_form` | Either |
+| **Console errors / warnings** | ✓ `console error` / `console warning` / `console` | ✗ not available | **playwright-cli** |
+| **Failed network requests** | ✓ `requests` / `request <n>` | ✗ not available | **playwright-cli** |
+| **JavaScript evaluation** | ✓ `eval "expr"` / `run-code "async p => {...}"` | ✓ `browser_evaluate` (limited) | **playwright-cli** |
+| **Generate Playwright locator from ref** | ✓ `generate-locator <ref> --raw` | ✗ not available | **playwright-cli** |
+| **Highlight element visually** | ✓ `highlight <ref>` / `highlight <ref> --hide` | ✗ not available | **playwright-cli** |
+| **Auth state save/load** | ✓ `state-save` / `state-load` | ✗ not available | **playwright-cli** |
+| **Storage inspection (cookies, localStorage)** | ✓ `cookie-list` / `localstorage-list` / `sessionstorage-list` | ✗ not available | **playwright-cli** |
+| **Persistent sessions** | ✓ `open --persistent --profile=` | ✗ not available | **playwright-cli** |
+| **Named sessions** | ✓ `-s=name open` (run multiple in parallel) | ✗ single global instance | **playwright-cli** |
+| **Video / tracing** | ✓ `video-start` / `video-chapter "title"` / `tracing-start` | ✗ not available | **playwright-cli** |
+| **Annotated screenshots (UI review)** | ✓ `show --annotate` | ✗ not available | **playwright-cli** |
+| Tab management | ✓ `tab-new` / `tab-list` / `tab-select` / `tab-close` | ✓ `browser_tabs` | Either |
+| Rich form fill (multiple fields at once) | ✗ one field at a time | ✓ `browser_fill_form` | **Playwright MCP** |
+| Network request mocking | ✓ `route "pattern" --body=...` / `unroute` | ✓ via `browser_run_code_unsafe` | **playwright-cli** |
+| File upload | ✓ `upload` | ✓ `browser_file_upload` | Either |
+| Dialog handling | ✓ `dialog-accept` | ✓ `browser_handle_dialog` | Either |
+
+### Decision rules
+
+1. **Always prefer `playwright-cli`** for any session that involves:
+   - Diagnosing failures (need console errors + failed requests)
+   - Auth state management (save/load OpenShift session)
+   - Multi-step workflows that need JS evaluation mid-flow
+   - Long exploration sessions (named sessions, persistent profile)
+
+2. **Use Playwright MCP** only when:
+   - `playwright-cli` is unavailable (`playwright-cli --version` errors)
+   - The task is a quick one-off snapshot/click and no diagnostic data is needed
+   - Rich multi-field form fill via `browser_fill_form` is more convenient
+
+3. **Combine both** for diagnostic workflows: use `playwright-cli` for the session (console errors, request inspection, JS eval) and fall back to Playwright MCP only for specific gaps (e.g. `browser_fill_form` for a complex form within a `playwright-cli` session is not possible — use `playwright-cli fill` per field instead).
+
+### Availability check (run once at session start)
+
+```bash
+playwright-cli --version 2>/dev/null && echo "available" || echo "unavailable"
+```
+
+If `unavailable`, use Playwright MCP (`Playwright-browser_*` tools) for the entire session.
+
+### Session Start Checklist (playwright-cli)
+
+Run once before the first navigation in every browser session:
+
+```bash
+# 1. Open browser with the project config, navigating directly to WEB_CONSOLE_URL from .env
+#    Config matches playwright.config.ts: Chrome channel, 1920x1080, chromeArgs,
+#    ignoreHTTPSErrors, action/navigation timeouts, data-test testIdAttribute.
+#    The URL is read from .env at open time — never hard-code cluster URLs.
+playwright-cli open --config=.playwright/cli.config.json \
+  "$(grep ^WEB_CONSOLE_URL .env | cut -d= -f2-)"
+
+# 2. Load saved OpenShift auth state — skip the login flow
+playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+```
+
+If `openshift-state.json` is missing or expired, log in manually then re-save:
+
+```bash
+playwright-cli open --config=.playwright/cli.config.json \
+  "$(grep ^WEB_CONSOLE_URL .env | cut -d= -f2-)"
+# complete the login flow in the browser, then:
+playwright-cli state-save playwright/mcp-validations/.auth/openshift-state.json
+```
+
+> The `.playwright/cli.config.json` file is the source of truth for browser launch settings.
+> Never use `playwright-cli open` without `--config` — it starts with no certificate bypass,
+> wrong viewport, and no Chrome channel, producing different behaviour from the test suite.
+> Never hard-code the cluster URL — always read it from `.env` via the grep one-liner above.
+
+### Session Start Checklist (Playwright MCP fallback)
+
+```
+Playwright-browser_resize → width: 1920, height: 1080
+# Navigate to WEB_CONSOLE_URL from .env and log in manually
+```
+
+### Diagnostic Pattern (playwright-cli)
+
+When a page appears blank or a feature is missing, capture the full picture before concluding:
+
+```bash
+playwright-cli console error          # browser JS errors — look for TypeError, plugin crashes
+playwright-cli requests               # list all requests
+playwright-cli request <n>            # inspect a specific request (headers + status)
+playwright-cli generate-locator <ref> --raw   # get a ready-to-use Playwright locator from a ref
+playwright-cli eval "document.getElementById('app')?.innerHTML?.substring(0, 500)"
+playwright-cli eval "document.querySelectorAll('[data-test-id]').length"
+```
+
+This pattern (as used in diagnosing the s390x kubevirt-plugin router crash) surfaces:
+- Plugin load failures (`TypeError: useNavigate is not a function`)
+- Auth session problems (`ERR_ABORTED` on API calls)
+- Module federation version mismatches (`Unsatisfied version` warnings)
+- DOM state vs visual state discrepancies (height: 0px elements)
+
+## Cluster Consistency (ALL MCP-Using Roles)
+
+**The `.env` file is the single source of truth for which cluster to use.** Before any browser session or direct `oc`/`kubectl` command, read `.env` and extract `CLUSTER_NAME` + `CLUSTER_DOMAIN` (or `WEB_CONSOLE_URL` / `CLUSTER_URL`). Verify that the target cluster matches.
+
+**Pre-flight check — do this once at the start of any session that touches a cluster:**
+
+1. Read `.env` and note the cluster identity (e.g., `bm13-ibm.ibmc.cnv-qe.rhood.us`)
+2. For **playwright-cli**: the saved auth state in `playwright/mcp-validations/.auth/openshift-state.json` is tied to a specific cluster — re-save it if the cluster changes
+3. For **Playwright MCP** (fallback): navigate to the `WEB_CONSOLE_URL` from `.env` — never assume the browser is already on the right cluster
+4. For **`kubevirt-ui-mcp`**: if the MCP server returns errors referencing a different cluster, fall back to direct `oc` commands using the `.env` credentials
+5. For **`oc` / `kubectl` commands**: always use a kubeconfig authenticated against the `.env` cluster
+
+**Why:** The `.env` file is what the test framework actually uses, so all manual exploration and validation must target the same cluster.
+
+## Git Safety (ALL Roles)
+
+- **NEVER commit directly to `main`** — always use a feature branch. If on `main`, ask for a branch name before committing.
+- **NEVER force push to `main`** — no exceptions. If a bad commit reaches `main`, revert it with a new commit.
+- **NEVER push to any remote** unless the user explicitly requests it.

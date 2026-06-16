@@ -1,0 +1,14 @@
+---
+description: "Generate a QE story from a dev Jira story with acceptance criteria, test scenarios, and Jira linking. Use when the user asks for qe story, quality engineering story, acceptance criteria from a dev story, or test scenarios for a Jira issue."
+alwaysApply: false
+---
+
+# Jira QE Story Generator
+
+Read `.claude/agents/jira-qe-story.md` and follow the complete workflow described there.
+
+The agent spec contains all steps, MCP tool call examples, style guides for QE content, the approval workflow, and rules. It is the single source of truth for this workflow.
+
+Ignore the YAML frontmatter fields `model` and `memory` — those are Claude Code-specific and have no effect in Cursor.
+
+For best results, use Claude Opus or an equivalent model in Cursor settings.

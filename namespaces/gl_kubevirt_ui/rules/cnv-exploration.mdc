@@ -1,0 +1,518 @@
+---
+description: CNV Exploration agent - Uses Playwright MCP to explore the live UI, identify untested features, and cross-reference Jira tickets for test coverage gaps
+alwaysApply: false
+---
+
+# CNV Exploration Agent
+
+You explore the live KubeVirt UI using the Playwright MCP browser, identify features that lack test coverage, and cross-reference with Jira tickets to find matching work items.
+
+## Command
+
+```
+/cnv-exploration <module> [--implement]
+```
+
+### Options
+
+| Option | Effect |
+|--------|--------|
+| *(none)* | **Read-only** — produce a gap report without modifying any code |
+| `--implement` | After the gap report, implement tests for the highest-priority untested Jira tickets found |
+
+### Available Modules
+
+| Module keyword | UI area | Nav path |
+|---|---|---|
+| `virtualmachines` | VM list, tree view, overview tab, filters, bulk actions | Sidebar → VirtualMachines |
+| `vm-detail` | VM detail page tabs (overview, config, events, console, snapshots, disks, network) | VM list → click VM |
+| `catalog` | Template and instance-type VM creation wizard | Sidebar → VirtualMachines → Create |
+| `templates` | Template list, detail, boot source management | Sidebar → Templates |
+| `bootable-volumes` | Bootable volume list, upload, clone, detail | Sidebar → Bootable volumes |
+| `instance-types` | Cluster/user instance types, YAML, detail | Sidebar → InstanceTypes |
+| `networking` | Virtual machine networks, NADs, UDNs, policies, services, routes | Sidebar → Networking section |
+| `migration-policies` | Migration policy list, create form, detail | Sidebar → MigrationPolicies |
+| `checkups` | Network latency, storage, self-validation checkups | Sidebar → Checkups |
+| `settings` | Virtualization settings, cluster config | Sidebar → Settings |
+| `overview` | Virtualization overview dashboard, widgets, health, top consumers | Sidebar → Cluster → Overview |
+| `storage-migration` | Storage migration plans list, migration wizard | Sidebar → Migration section |
+
+Multiple modules can be provided: `/cnv-exploration bootable-volumes checkups`
+
+Implementation mode: `/cnv-exploration storage-migration --implement`
+
+---
+
+## Workflow
+
+### Phase 0: Pre-flight (`kubevirt-ui-mcp`)
+
+Before starting UI exploration, use `kubevirt-ui-mcp` for quick pre-flight checks and existing coverage baseline.
+
+**Step 1 — Cluster health** (if cluster tools are needed):
+- Call `check_cluster_health` to verify the cluster is reachable, CNV is running, and nodes are ready
+- Call `cleanup_stale_namespaces` with `older_than_hours: 4` to clear orphaned `pw-*` namespaces from previous runs
+- **Fallback**: Skip pre-flight if `kubevirt-ui-mcp` is unavailable; cluster issues will surface during Playwright MCP navigation
+
+**Step 2 — Existing coverage baseline**:
+- Call `get_coverage_for_feature` with the module keyword to get spec files, step drivers, page objects, Jira IDs, and coverage data
+- Call `get_tier_distribution` to understand the current test distribution
+- **Fallback**: Use manual grep searches as documented in Phase 2
+
+This baseline eliminates the need for manual `rg` searches in Phase 2 and provides structured data for the coverage map.
+
+### Phase 1: UI Discovery
+
+Use `playwright-cli` as the preferred browser driver for module sweeps. It provides console error capture, network request inspection, and auth state management — all critical for diagnosing why a page doesn't render expected content. Snapshots are stored as files and referenced by path rather than embedded in context — this keeps long multi-tab exploration sessions within the context window.
+
+**Tool selection**: Follow the capability matrix in `orchestrator.mdc § Browser Automation Tool`. Run `playwright-cli --version` to confirm availability. If unavailable, fall back to Playwright MCP (`Playwright-browser_*` tools) for the entire session.
+
+#### Session setup (run once per exploration)
+
+Follow `orchestrator.mdc § Session Start Checklist`. Quick reference:
+```bash
+playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+playwright-cli resize 1920 1080
+```
+If `openshift-state.json` is missing, log in manually first (see `playwright/docs/playwright-cli-setup.md`).
+
+#### Page blank / plugin not loaded — diagnostic steps
+
+If a module page appears blank or the Virtualization sidebar is missing after navigation, run the diagnostic pattern (see `orchestrator.mdc § Diagnostic Pattern`) before concluding:
+
+```bash
+playwright-cli console error          # plugin JS errors (TypeError, version mismatches)
+playwright-cli requests               # check for ERR_ABORTED on plugin-manifest.json or API calls
+playwright-cli eval "document.querySelectorAll('[data-test-id]').length"   # DOM elements present?
+playwright-cli eval "document.getElementById('app')?.innerText?.substring(0, 300)"
+```
+
+Common causes and signals:
+- `TypeError: useNavigate is not a function` → router version mismatch between plugin and console (cluster issue)
+- `Unsatisfied version X from openshift-console of ... react-router-dom-v5-compat` → module federation incompatibility
+- `plugin-manifest.json - net::ERR_ABORTED` → cert trust issue (needs `--ignore-certificate-errors` in test runner, not in playwright-cli)
+- All API calls `ERR_ABORTED` after login → session cookie not being sent (storage state saved too early)
+- `Missing i18n key` errors → plugin JS loaded but locale file failed (plugin IS running, locales may 404)
+
+For each requested module:
+
+1. **Navigate to the module's page**:
+   ```bash
+   playwright-cli goto <WEB_CONSOLE_URL><module-path>
+   ```
+
+2. **Verify the Virtualization view is active** — snapshot and confirm the sidebar contains the "Virtualization" heading with sub-items (VirtualMachines, Templates, Bootable volumes, etc.). Some modules (Templates, Networking, Storage) also exist in the core OpenShift platform — always ensure you are exploring the **Virtualization plugin** version, not the platform version:
+   ```bash
+   playwright-cli snapshot
+   ```
+
+3. **Capture the full accessibility snapshot** — document all interactive elements, tabs, buttons, widgets, forms:
+   ```bash
+   playwright-cli snapshot
+   ```
+   The CLI writes the snapshot to `.playwright-cli/page-<timestamp>.yml`. Read the file to extract `data-test` and `data-test-id` attributes and element refs.
+
+4. **Explore sub-pages and tabs** — click through each tab, menu, and expandable section:
+   ```bash
+   playwright-cli click <ref>       # click a tab or menu item by ref from the snapshot
+   playwright-cli snapshot          # snapshot after each navigation
+   ```
+   - For action menus: open kebab/dropdown, document available actions
+   - For forms/modals: open create/edit dialogs, document all fields and controls
+   - For tables: document column headers, filter options, sort capabilities
+
+5. **Document all `data-test` and `data-test-id` attributes** found in snapshot files — these are the testable UI anchors.
+
+6. **Session cleanup** after all modules explored:
+   ```bash
+   playwright-cli close
+   ```
+
+7. **Build a Feature Map** for the module:
+   ```
+   ## Feature Map: <Module Name>
+   
+   ### Pages / Tabs
+   - <page/tab name>: <URL pattern>
+     - Elements: <interactive elements found>
+     - Actions: <available user actions>
+     - Widgets: <information displays>
+   
+   ### User Workflows
+   - <workflow name>: <step 1> → <step 2> → <step 3>
+   
+   ### data-test Attributes
+   - [data-test="..."] — <element description>
+   ```
+
+### Phase 2: Test Coverage Analysis
+
+1. **Query existing coverage via `kubevirt-ui-mcp`** (preferred):
+   - Call `get_coverage_for_feature` with the module keyword — returns spec files, step drivers, page objects, Jira IDs in structured format
+   - Call `find_tests_by_jira` for any specific Jira IDs found during UI discovery
+   - **Fallback** (if `kubevirt-ui-mcp` unavailable): Use manual searches:
+     ```bash
+     rg "<module-keyword>" playwright/tests/ --type ts -l
+     rg "<module-keyword>" playwright/docs/ -l
+     # For src/ method/selector searches use search_methods() or get_selector_map() — NOT rg on src/
+     ```
+
+2. **Read relevant spec files** to understand what's currently tested — use the file list from step 1.
+
+3. **Build a Coverage Map** — for each feature discovered in Phase 1, mark coverage:
+   ```
+   ## Coverage Map: <Module Name>
+   
+   | Feature | Tested? | Spec file | Jira ID | Notes |
+   |---------|---------|-----------|---------|-------|
+   | Create VM from template | Yes | catalog.spec.ts | CNV-10151 | Full flow covered |
+   | Bulk delete with protection | Partial | vm-bulk-operations.spec.ts | CNV-11940 | Missing error case |
+   | Storage migration wizard | Yes | vm-migrate-storage.spec.ts | CNV-11626 | No offline path |
+   | <feature> | No | — | — | Missing entirely |
+   ```
+
+### Phase 3: Jira Cross-Reference
+
+1. **Query Jira for matching tickets** using the search API:
+
+   **Base JQL** (always applied):
+   ```
+   project = CNV
+   AND component IN ("CNV User Interface", "CNV User Experience")
+   AND type IN (Bug, Story)
+   ```
+
+   **Module-specific keyword filter** — append `AND text ~ "<keywords>"` based on the module:
+
+   | Module | Jira keywords |
+   |--------|---------------|
+   | `virtualmachines` | `"virtual machine" OR "VM list" OR "tree view"` |
+   | `vm-detail` | `"VM detail" OR "VM overview" OR "configuration tab"` |
+   | `catalog` | `"catalog" OR "create VM" OR "customize wizard"` |
+   | `templates` | `"template"` |
+   | `bootable-volumes` | `"bootable volume" OR "boot source" OR "boot volume"` |
+   | `instance-types` | `"instance type" OR "instancetype"` |
+   | `networking` | `"network" OR "NAD" OR "NIC" OR "UDN"` |
+   | `migration-policies` | `"migration policy"` |
+   | `checkups` | `"checkup" OR "self-validation"` |
+   | `settings` | `"settings" OR "cluster settings"` |
+   | `overview` | `"overview" OR "dashboard" OR "widget"` |
+   | `storage-migration` | `"storage migration" OR "migrate storage"` |
+
+   **Status filters** — run two queries:
+   - **Actionable** (needs test coverage): `AND status IN ("Verified", "ON_QA", "Release Pending", "Closed")`
+   - **In-flight** (may need test soon): `AND status IN ("In Progress", "Code Review")`
+
+2. **API call format**:
+   ```bash
+   JQL='project = CNV AND component IN ("CNV User Interface", "CNV User Experience") AND type IN (Bug, Story) AND status IN ("Verified", "ON_QA", "Release Pending", "Closed") AND text ~ "<keywords>" ORDER BY updated DESC'
+   
+   curl -s "https://redhat.atlassian.net/rest/api/3/search/jql?jql=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$JQL'))")&fields=key,summary,status,issuetype,priority,labels,components,fixVersions&maxResults=30" | python3 -c "
+   import sys, json
+   data = json.load(sys.stdin)
+   print(f'Total results: {data.get(\"total\", \"?\")}')
+   for issue in data.get('issues', []):
+       f = issue['fields']
+       fv = ', '.join([v['name'] for v in f.get('fixVersions', [])]) or 'None'
+       status = f['status']['name']
+       itype = f['issuetype']['name']
+       print(f'{issue[\"key\"]}: [{itype}] [{status}] [{fv}] {f[\"summary\"][:100]}')
+   "
+   ```
+
+3. **Cross-reference each Jira ticket** against existing test coverage:
+   - Call `find_tests_by_jira` with the ticket ID — returns spec files, tier, test names
+   - **Fallback** (if `kubevirt-ui-mcp` unavailable): `rg "CNV-XXXXX" playwright/tests/ playwright/docs/`
+
+4. **Classify tickets** into categories:
+   | Category | Meaning |
+   |----------|---------|
+   | **Untested** | No test references found, ticket is Verified/Closed — needs test |
+   | **Partially tested** | Some aspects covered but gaps remain |
+   | **Covered** | Already has test coverage — no action needed |
+   | **In-flight** | Ticket still in development — monitor for test readiness |
+   | **Not testable via UI** | Backend-only fix or no UI component to validate |
+
+### Phase 4: Gap Report
+
+Produce a consolidated report:
+
+```markdown
+# CNV Exploration Report: <Module Name>
+
+## Executive Summary
+- **Module explored**: <module>
+- **Features discovered**: <count>
+- **Tested features**: <count> (<percentage>%)
+- **Coverage gaps found**: <count>
+- **Matching Jira tickets**: <count>
+- **Tickets needing tests**: <count>
+
+## Untested Features (from UI Discovery)
+
+| # | Feature | UI Location | data-test attrs | Suggested test type |
+|---|---------|-------------|-----------------|---------------------|
+| 1 | <feature> | <page/tab> | <selectors> | gating/tier1/tier2 |
+
+## Jira Tickets Needing Test Coverage
+
+| # | Ticket | Type | Status | Fix Version | Summary | Coverage |
+|---|--------|------|--------|-------------|---------|----------|
+| 1 | CNV-XXXXX | Bug | Verified | v4.22.0 | <summary> | Untested |
+
+## Recommended Next Steps
+
+1. **Quick wins** (existing spec files can absorb — use `/jira-task`):
+   - CNV-XXXXX → expand `<existing-spec>.spec.ts`
+   
+2. **New test files needed**:
+   - <feature area> → create `<new-spec>.spec.ts`
+   
+3. **Framework gaps** (need new PO/SD methods first):
+   - <missing method> → <page-object>.ts
+```
+
+### Phase 5: Implementation Planning (only with `--implement`)
+
+When the `--implement` flag is provided, the **CNV Explorer** prepares a detailed implementation plan and then **hands off to the Automation Implementer** for the actual code changes.
+
+> **Role boundary**: The CNV Explorer owns Phases 1–5 (discovery, analysis, planning). The Automation Implementer owns Phase 6 (coding). This keeps each agent focused on its domain.
+
+#### Step 1 — Prioritize tickets
+
+From the gap report, select tickets to implement:
+- **First**: Verified/Closed bugs with merged PRs (most testable)
+- **Second**: Verified/Closed stories with clear UI changes
+- **Skip**: In-flight tickets, backend-only fixes, tickets without merged PRs
+- Select up to 3 tickets per run (prevent scope creep)
+
+#### Step 2 — Route each ticket: Expand vs. New
+
+For **each** selected ticket, apply the same routing decision as `/jira-task` Phase 1.5:
+
+1. Search for existing tests covering the same feature area:
+   - Call `get_coverage_for_feature` and `find_tests_by_jira` for structured results
+   - **Fallback** (if `kubevirt-ui-mcp` unavailable):
+     ```bash
+     rg "CNV-XXXXX" playwright/tests/ playwright/docs/
+     rg "<feature-keyword>" playwright/tests/ --type ts -l
+     ```
+
+2. Classify:
+
+   | Condition | Route | Action |
+   |-----------|-------|--------|
+   | An existing `test()` in the same spec file covers the same feature and can absorb the validation | **Expand** | Add `test.step()` blocks to the existing test; append to the existing STD |
+   | An existing spec file covers the feature area but no single test fits | **Expand** | Add a new `test()` inside the existing `test.describe`; append to the existing STD |
+   | No existing spec file or test covers this feature area | **New** | Create a new spec file and STD document |
+
+#### Step 3 — Determine tier placement
+
+Apply the same tier placement criteria as `qa-architect.mdc`:
+
+| Tier | Max Duration | Criteria |
+|------|-------------|----------|
+| **Gating** | < 2 min | No resource creation beyond global setup. Smoke checks: page loads, widget visibility, navigation flows. Must be parallelizable. |
+| **Tier1** | < 6 min | Creates 1–2 VMs/resources. CRUD workflows, configuration changes, lifecycle actions. Uses `k8sClient` to set up resources in isolated namespaces. |
+| **Tier2** | < 6 min | Complex multi-resource setups (NADs + VMs + policies). Networking, hotplug, cross-resource dependencies. |
+
+Decision factors:
+- **Resource creation cost** — tests creating VMs are tier1+, not gating
+- **Duration** — long waits (VM boot, migration) push to tier1/tier2
+- **Parallelism safety** — tests sharing cluster-wide state belong in gating (serial) or need namespace isolation
+- **CI budget** — gating runs on every PR, tier1 on merge, tier2 nightly
+- **Jira labels** — `TIER-1`, `gating` labels on the ticket override default heuristics
+
+#### Step 4 — Present the implementation plan
+
+Show the user a structured plan for **each** ticket:
+
+```markdown
+## Implementation Plan
+
+| # | Ticket | Type | Status | Route | Target Spec | Tier | Justification |
+|---|--------|------|--------|-------|-------------|------|---------------|
+| 1 | CNV-XXXXX | Bug | Verified | Expand | vm-actions.spec.ts | Tier1 | Creates VM, < 6 min |
+| 2 | CNV-YYYYY | Story | Closed | New | vm-snapshots.spec.ts | Gating | Read-only check, < 2 min |
+
+### Per-ticket detail:
+
+#### CNV-XXXXX (Expand → vm-actions.spec.ts, Tier1)
+- **What to test**: <description from Jira>
+- **Existing coverage**: <what's already tested in the target spec>
+- **New validations**: <test.step() blocks or new test() to add>
+- **Framework gaps**: <missing PO methods, SD wrappers — list each>
+- **Selectors discovered**: <data-test attributes found via MCP>
+
+#### CNV-YYYYY (New → vm-snapshots.spec.ts, Gating)
+- ...
+```
+
+**Wait for user approval** before proceeding to Phase 6.
+
+#### Step 5 — Create a branch
+
+```bash
+git checkout -b <git-user>/cnv-exploration-<module>-tests
+```
+
+---
+
+### Phase 6: Implementation — Automation Implementer
+
+> **Role switch**: From this point, operate as the **Automation Implementer** (`automation-implementer.mdc`).
+
+The Automation Implementer receives the approved plan from Phase 5 and executes it. The plan specifies the route (Expand/New), tier, target spec file, framework gaps, and selectors for each ticket.
+
+#### For Expand-routed tickets
+
+Follow the expand workflow:
+1. Validate locators via playwright-cli (navigate to the relevant pages, inspect elements, use `generate-locator <ref> --raw`)
+2. Add page object methods if missing (inline locators for single-use, class properties for 2+ use)
+3. Add `test.step()` blocks to the existing test, or a new `test()` in the existing `test.describe`
+4. Append to the existing STD document
+
+#### For New-routed tickets
+
+Follow `/jira-task` Phases 2–3:
+1. QA Architect gap analysis (reusable components, missing PO methods, locator validation via playwright-cli)
+2. Page Object methods — new locators and interaction methods
+3. Test spec file — in the correct tier directory:
+   - Gating: `playwright/tests/gating/`
+   - Tier1: `playwright/tests/tier1/<feature-area>/`
+   - Tier2: `playwright/tests/tier2/<feature-area>/`
+4. STD document — in the matching tier directory under `playwright/docs/`
+5. Register new Page Objects in the per-folder fixture if created
+
+#### For all tickets
+
+- Run `npx eslint --fix` and `npx tsc --noEmit` on changed files
+- Optionally run the test to verify (if cluster is available)
+
+#### Implementation summary
+
+```markdown
+## Implementation Summary
+
+| # | Ticket | Route | Tier | Spec File | Files Changed | Status |
+|---|--------|-------|------|-----------|---------------|--------|
+| 1 | CNV-XXXXX | Expand | Tier1 | vm-actions.spec.ts | 3 files | Done |
+| 2 | CNV-YYYYY | New | Gating | vm-snapshots.spec.ts | 5 files | Done |
+| 3 | CNV-ZZZZZ | — | — | — | 0 files | Blocked |
+
+### Blockers / Follow-ups
+- <any issues encountered>
+```
+
+#### Commit
+
+Squash all implementation changes into a single commit:
+```
+test(<module>): add E2E coverage for CNV-XXXXX, CNV-YYYYY
+
+- <brief description of each ticket's test>
+```
+
+---
+
+## Navigation URLs by Module
+
+Use these URL patterns for MCP navigation (replace `<ns>` with the active namespace from `.env` or `pw-test-ns`):
+
+| Module | URL path |
+|--------|----------|
+| `virtualmachines` | `/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine` |
+| `vm-detail` | `/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine/<vm-name>` |
+| `catalog` | `/k8s/ns/<ns>/catalog` (or navigate via VMs → Create) |
+| `templates` | `/k8s/ns/<ns>/templates` |
+| `bootable-volumes` | `/k8s/ns/<ns>/bootablevolumes` |
+| `instance-types` | `/k8s/cluster/instancetype.kubevirt.io~v1beta1~VirtualMachineClusterInstancetype` |
+| `networking` | `/k8s/cluster/virtualmachine-networks` |
+| `migration-policies` | `/k8s/cluster/migrations.kubevirt.io~v1alpha1~MigrationPolicy` |
+| `checkups` | `/k8s/ns/<ns>/checkups` |
+| `settings` | `/k8s/ns/<ns>/virtualization-settings` |
+| `overview` | `/k8s/ns/<ns>/kubevirt.io~v1~VirtualMachine` (then click Overview tab) |
+| `storage-migration` | `/k8s/ns/<ns>/migrations.kubevirt.io~v1alpha1~MultiNamespaceVirtualMachineStorageMigrationPlan` |
+
+## Test Spec Directories by Module
+
+| Module | Spec directories |
+|--------|-----------------|
+| `virtualmachines` | `tests/tier1/virtualmachines/vm-list/`, `tests/gating/` |
+| `vm-detail` | `tests/tier1/virtualmachines/vm-tabs/`, `tests/tier1/virtualmachines/vm-actions/` |
+| `catalog` | `tests/tier1/catalog/`, `tests/gating/` |
+| `templates` | `tests/tier1/templates/` |
+| `bootable-volumes` | `tests/tier1/bootable-volumes/` |
+| `instance-types` | `tests/tier1/instanceTypes/` |
+| `networking` | `tests/tier1/networking/`, `tests/tier2/networking/` |
+| `migration-policies` | `tests/tier1/migrationpolicies/` |
+| `checkups` | `tests/tier1/checkups/` |
+| `settings` | `tests/tier1/overview/settings/` |
+| `overview` | `tests/tier1/overview/`, `tests/gating/` |
+| `storage-migration` | `tests/tier1/virtualmachines/vm-actions/vm-migrate-storage.spec.ts` |
+
+## Rules
+
+### Read-only mode (default — no `--implement` flag)
+- **Do NOT modify any code** — this is a read-only exploration
+- **Do NOT create branches, commits, or PRs**
+
+### Implementation mode (`--implement` flag)
+- **CNV Explorer** (Phases 1–5): discovery, analysis, Jira cross-reference, routing decisions, tier placement, plan presentation — **no code changes**
+- **Automation Implementer** (Phase 6): receives the approved plan and implements all code changes following `automation-implementer.mdc` rules
+- **Always present the implementation plan and wait for user approval** before switching to the Automation Implementer
+- Create a dedicated branch for the implementation
+- Squash all changes into a single commit before finishing
+- Run lint (`npx eslint --fix`) and type checks (`npx tsc --noEmit`) on all changed files
+
+### Both modes
+- **Check tool availability first** — run `playwright-cli --version 2>/dev/null && echo ok || echo unavailable` once at session start. If unavailable, use Playwright MCP for the entire session. See `orchestrator.mdc § Browser Automation Tool` for the full capability matrix and decision rules.
+- **Match Playwright viewport** — resize to 1920×1080 at the start of the session (`playwright-cli resize 1920 1080`, or `Playwright-browser_resize` when using MCP fallback). Do this once before the first navigation.
+- **Load auth state first** — run `playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json` before navigating. Do not log in manually unless the saved state is missing or expired. (Playwright MCP fallback: navigate to `WEB_CONSOLE_URL` and log in manually.)
+- **Always verify you are in the Virtualization view** before exploring any module. Some modules (Templates, Networking, Storage, etc.) also exist in the core OpenShift platform. After navigating, confirm the sidebar shows the Virtualization section (heading "Virtualization" with sub-items like VirtualMachines, Templates, Bootable volumes). If the sidebar shows the core platform view instead, navigate via the Virtualization sidebar entry first. Use the module URL paths listed in [Navigation URLs by Module](#navigation-urls-by-module) — these resolve within the Virtualization plugin context.
+- Use snapshots over screenshots when inspecting element structure (`playwright-cli snapshot` writes a YAML file to `.playwright-cli/`)
+- Take screenshots only for visual documentation of complex layouts (`playwright-cli screenshot`)
+- Cross-reference every discovered feature with existing tests before classifying as "untested"
+- Include `data-test` attribute values in the report — they directly map to page object locators
+- When querying Jira, always URL-encode the JQL properly via `python3 -c "import urllib.parse; ..."`
+- Focus on **actionable** tickets (Verified, ON_QA, Release Pending, Closed) — these have merged PRs and can be tested
+
+### CRUD + API-Level Coverage (PRIMARY DIRECTIVE)
+
+For every module explored, full CRUD operations are a **primary directive** — not optional. Coverage is incomplete unless all of the following are exercised and the corresponding network traffic is captured:
+
+| Operation | What to do | Network check |
+|-----------|-----------|---------------|
+| **Create** | Submit the create form / wizard end-to-end | Capture the `POST` or `PUT` request: URL, status code, request body schema |
+| **Read** | Load the list view and detail page | Capture `GET` requests; verify response shape matches what the UI renders |
+| **Update** | Edit an existing resource (inline edit, modal, YAML editor) | Capture the `PATCH` or `PUT` request: changed fields, response code |
+| **Delete** | Delete a resource (single + bulk where available) | Capture the `DELETE` request: URL pattern, confirm 200/202/204 |
+
+#### How to capture network requests during UI exploration
+
+Use `playwright-cli` (preferred):
+```bash
+playwright-cli goto <URL>          # navigate to the module
+# ... perform the CRUD operation ...
+playwright-cli requests            # list all captured requests
+playwright-cli request <n>         # inspect request N (headers + body + response)
+```
+
+For each CRUD operation, record in the Feature Map:
+```
+### CRUD — <Resource Name>
+- Create:  POST <endpoint-pattern>  → <status>  (e.g. POST /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines → 201)
+- Read:    GET  <endpoint-pattern>  → <status>
+- Update:  PATCH <endpoint-pattern> → <status>
+- Delete:  DELETE <endpoint-pattern> → <status>
+```
+
+These endpoint + status code pairs feed directly into the API-level coverage gap analysis. Any CRUD operation that has UI test coverage but **no matching API test** in `playwright/tests/api/` is a candidate for API test expansion (see `/api-cross-check`).
+
+### Resource creation policy (MANDATORY)
+- **In test code** (spec files, page objects): All VM creation, namespace creation, and any other Kubernetes resource CRUD **must** go through `k8sClient` (the `KubernetesClient` fixture injected via `scenario-test-fixture.ts`). Shell-based `oc apply`, `oc create`, `kubectl apply`, etc. are **forbidden**. See `automation-implementer.mdc` for the full policy.
+- **During browser exploration** (ad-hoc inspection via `playwright-cli` or MCP, not test code): If you need to create a temporary resource to inspect UI elements, use `k8sClient` methods when possible. If you must fall back to shell `oc` commands for quick ad-hoc exploration, clearly document the resource was created manually and ensure:
+  1. The resource uses the `pw-` prefix naming convention
+  2. The resource is cleaned up after exploration (`oc delete ...`)
+  3. The final test implementation uses `k8sClient` exclusively — no `oc` in committed code
+- **Namespace creation in tests**: Always use `k8sClient.namespace.create()` or the equivalent `KubernetesClient` handler method. Never use `oc create namespace` or `oc new-project`.

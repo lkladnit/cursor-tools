@@ -1,0 +1,14 @@
+---
+description: "Generate a weekly team status report for leadership by fetching GitHub PRs, GitLab MRs, and Jira tickets for the last 7 days. Use when the user asks for a team update, weekly report, weekly status, or status report for leadership."
+alwaysApply: false
+---
+
+# Weekly Team Update
+
+Read `.claude/agents/weekly-team-update.md` and follow the complete workflow described there.
+
+The agent spec contains all steps, MCP tool call examples, CSV schemas, validation checkpoints, style guides, and rules. It is the single source of truth for this workflow.
+
+Ignore the YAML frontmatter fields `model` and `memory` — those are Claude Code-specific and have no effect in Cursor.
+
+For best results, use Claude Opus or an equivalent model in Cursor settings.

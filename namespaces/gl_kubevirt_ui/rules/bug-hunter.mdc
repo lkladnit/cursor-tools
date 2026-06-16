@@ -1,0 +1,394 @@
+---
+description: Bug Hunter agent - Explores the live UI via Playwright MCP following test-mapped workflows, finds visual/functional issues, and cross-references Jira for existing reports
+alwaysApply: false
+---
+
+# Bug Hunter Agent
+
+You systematically explore the live KubeVirt UI using Playwright MCP, replaying user workflows mapped from existing test cases. Your goal is to find visual, functional, or UX issues — then cross-reference each finding with Jira to determine if it's already reported.
+
+## Command
+
+```
+/bug-hunt <module>
+```
+
+### Available Modules
+
+Same as `cnv-exploration.mdc` — see that rule for the full module table and URL patterns.
+
+---
+
+## Parallelization Strategy
+
+Playwright MCP runs a single browser instance per session, so UI exploration (Phase 2) is inherently sequential. However, non-browser work can be parallelized:
+
+| Phase | Parallelizable? | Strategy |
+|-------|----------------|----------|
+| Phase 1 (Interaction Plan) | Yes — sub-agents | Launch one `generalPurpose` sub-agent per spec file to read and extract workflows in parallel |
+| Phase 2 (MCP Replay) | No — single browser | Sequential; group by page to minimize navigation |
+| Phase 3 (Issue Documentation) | No | Inline with Phase 2 |
+| Phase 4 (Jira Cross-Reference) | **Yes — sub-agents** | Launch one `generalPurpose` sub-agent per issue to query Jira in parallel |
+| Phase 5 (Report) | No | Aggregation step |
+
+### When to parallelize
+
+- **Phase 1**: If the module has **3+ spec files**, launch sub-agents to read them concurrently. Each sub-agent extracts `test()` / `test.step()` blocks and returns a structured workflow list.
+- **Phase 4**: If **2+ issues** are found, launch one sub-agent per issue to query Jira concurrently. Each sub-agent runs the JQL queries, checks for GitHub PRs, and returns the classification.
+
+### Sub-agent prompt templates
+
+**Phase 1 — Spec File Reader** (use `model: "fast"`):
+```
+Read the Playwright spec file at <path> and extract all test workflows.
+For each test() block, return: Jira ID (if present), test name, and a list of
+test.step() descriptions. Also note which page objects are used
+(from import statements). Return as a structured table.
+```
+
+**Phase 4 — Jira Cross-Reference** (use `model: "fast"`):
+```
+Search Jira for an existing ticket matching this issue:
+Title: <title>
+Description: <description>
+Module: bootable-volumes
+
+Run these queries via curl against https://redhat.atlassian.net/rest/api/3/search/jql:
+1. Exact match: text ~ "<keywords>"
+2. Broader match: text ~ "<module keyword>" AND updated >= -180d
+
+For each match, check if a GitHub PR is linked in comments.
+Classify as: Exact match / Related / Fixed but not deployed / No match.
+Return: Jira key, status, fix version, PR link, classification.
+```
+
+---
+
+## Workflow
+
+### Phase 1: Build the Interaction Plan from Test Cases
+
+Before touching the browser, study the existing test coverage for the module to build a map of **user workflows to replay**.
+
+1. **Get coverage baseline and cluster context** via `kubevirt-ui-mcp`:
+   - Call `get_coverage_for_feature` with the module keyword — returns spec files, page objects, Jira IDs in structured format
+   - Call `get_cluster_info` to capture cluster/CNV version for the report header
+   - Call `get_hco_status` to verify CNV operator is healthy before spending time on UI exploration
+   - **Fallback**: Find spec files manually using the mapping in `cnv-exploration.mdc § Test Spec Directories by Module`
+2. **Read each spec file** and extract every `test()` and `test.step()` — these are the user workflows. If 3+ spec files exist, launch parallel sub-agents to read them concurrently.
+3. **Read the corresponding STD** (`playwright/docs/`) for high-level descriptions
+4. **Read the page objects** used by the tests to understand the UI interactions (clicks, fills, navigations, assertions) — use `get_class_surface(ClassName)` from `kubevirt-ui-mcp` rather than reading files directly
+5. **Build an Interaction Plan** — ordered list of workflows to replay in the browser:
+
+```markdown
+## Interaction Plan: <Module>
+
+| # | Source Test | Workflow | Key Interactions |
+|---|-----------|----------|-----------------|
+| 1 | `spec.ts:L42` ID(CNV-XXXXX) | Create VM from template | Navigate catalog → select RHEL9 → fill name → click Create → wait for Running |
+| 2 | `spec.ts:L85` ID(CNV-YYYYY) | Filter VMs by status | Open filter dropdown → select Running → verify table filtered |
+| 3 | ... | ... | ... |
+```
+
+---
+
+### Phase 2: Replay Workflows via playwright-cli
+
+Use `playwright-cli` as the primary browser driver for workflow replay. It produces concise output, keeps context lean across many replay steps, and — unlike Playwright MCP — captures console errors, failed network requests, and supports tracing/video recording for high-quality bug evidence.
+
+**Tool selection**: Follow the capability matrix in `orchestrator.mdc § Browser Automation Tool`. Check availability first:
+
+```bash
+playwright-cli --version 2>/dev/null && echo "available" || echo "unavailable"
+```
+
+If unavailable, fall back to `Playwright-browser_*` MCP tools for the entire session. Note that when using the MCP fallback, console errors and network request details are not available — document this limitation in the bug report if it affects evidence quality.
+
+#### Session setup (run once at the start of the bug hunt)
+
+Follow `orchestrator.mdc § Session Start Checklist`. Quick reference:
+```bash
+playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+playwright-cli resize 1920 1080
+playwright-cli tracing-start   # capture full session evidence
+```
+If `openshift-state.json` does not exist, log in manually (see `playwright/docs/playwright-cli-setup.md`), save with `playwright-cli state-save playwright/mcp-validations/.auth/openshift-state.json`, then resize and start tracing.
+
+For each workflow in the Interaction Plan:
+
+1. **Navigate** to the starting page:
+   ```bash
+   playwright-cli goto <URL>
+   ```
+
+2. **Verify Virtualization view** — snapshot and confirm sidebar shows "Virtualization" heading (not core platform):
+   ```bash
+   playwright-cli snapshot
+   ```
+
+   If the page appears blank or the Virtualization sidebar is missing, run the diagnostic pattern **before** marking this as a bug:
+   ```bash
+   playwright-cli console error          # look for TypeError, version mismatches, plugin crashes
+   playwright-cli requests               # look for ERR_ABORTED on plugin-manifest.json or API calls
+   playwright-cli eval "document.querySelectorAll('[data-test-id]').length"
+   ```
+   If the errors point to a cluster-level issue (plugin/console version incompatibility, cert errors, auth problems), document it as **Environment Issue** rather than a product bug and move on to the next workflow.
+
+3. **Replay each interaction step**:
+   ```bash
+   playwright-cli snapshot                     # before each action — inspect element refs
+   playwright-cli click <ref>                  # click by ref from snapshot
+   playwright-cli fill <ref> <text>            # fill an input
+   playwright-cli type <text>                  # type into focused element
+   playwright-cli press <key>                  # keyboard shortcut
+   playwright-cli snapshot                     # after each action — verify result
+   ```
+   For DOM inspection not visible in the snapshot:
+   ```bash
+   playwright-cli eval 'document.querySelector("[data-test=\"...\"]")?.textContent'
+   ```
+
+4. **At each step, check for**:
+
+| Category | What to look for |
+|----------|-----------------|
+| **Functional** | Action doesn't produce expected result, button does nothing, form doesn't submit, navigation goes wrong |
+| **Visual** | Broken layout, overlapping elements, missing text/icons, truncated content, wrong colors/states |
+| **Data** | Empty tables/cells that should have data, wrong values, stale data after action, NO_DATA_DASH where real data expected |
+| **Error** | Console JS errors (`playwright-cli console error`), network 4xx/5xx (`playwright-cli network`), error boundaries, "Something went wrong" messages |
+| **UX** | Confusing flow, missing feedback after action, slow responses (>3s), missing loading indicators, unclear error messages |
+| **Accessibility** | Missing aria labels, non-focusable interactive elements, keyboard navigation gaps |
+
+5. **When an issue is found**:
+   ```bash
+   # Screenshot for visual evidence
+   playwright-cli screenshot <issue-description>.png
+
+   # Snapshot for DOM state evidence
+   playwright-cli snapshot
+
+   # Console errors
+   playwright-cli console error
+
+   # Network failures
+   playwright-cli network
+   ```
+   If the issue involves a VM or resource in a bad state, use `get_vm_events` or `get_resource` from `kubevirt-ui-mcp` to correlate with cluster-side events. If pods are crashing, use `oc_logs` from `kubevirt-ui-mcp` to retrieve operator logs.
+
+   Document the issue with all evidence before moving to the next workflow.
+
+   **Optional: start video recording for the reproduction sequence**:
+   ```bash
+   playwright-cli video-start <issue-N>-reproduction.webm
+   # ... reproduce the issue step-by-step ...
+   playwright-cli video-stop
+   ```
+
+#### Session teardown
+
+After all workflows are replayed:
+
+```bash
+# Save the full session trace (covers all replayed workflows)
+playwright-cli tracing-stop <output-dir>/session-trace.zip
+
+playwright-cli close
+```
+
+The trace can be opened with `npx playwright show-trace session-trace.zip` for frame-by-frame inspection.
+
+---
+
+### Phase 3: Issue Documentation
+
+For each issue found, document:
+
+```markdown
+### Issue #N: <Short Title>
+
+**Category:** Functional / Visual / Data / Error / UX / Accessibility
+**Severity:** Critical / Major / Minor / Cosmetic
+**Found during:** Workflow #X — <workflow name>
+**Page:** <URL path>
+
+**Steps to reproduce:**
+1. Navigate to ...
+2. Click ...
+3. Observe ...
+
+**Expected result:** <what should happen>
+**Actual result:** <what actually happens>
+
+**Evidence:**
+- Screenshot: <filename>
+- Console errors: <if any>
+- Network failures: <if any>
+- DOM state: <relevant data-test attributes, element visibility>
+```
+
+---
+
+### Phase 4: Jira Cross-Reference (Parallel)
+
+For **each** documented issue, search Jira to check if it's already reported. **When 2+ issues are found, launch parallel sub-agents** — one per issue — to query Jira concurrently.
+
+#### Sequential mode (1 issue)
+
+Run the queries inline.
+
+#### Parallel mode (2+ issues)
+
+Launch one `generalPurpose` sub-agent per issue using the Task tool with `model: "fast"`. Each sub-agent receives:
+- The issue title, description, and category
+- The module name (for keyword selection)
+- The JQL template and curl command below
+- Instructions to return: Jira key, status, fix version, PR link, classification
+
+All sub-agents run concurrently in a single message with multiple Task tool calls.
+
+#### Query procedure (per issue)
+
+1. **Build search keywords** from the issue description (e.g., "empty interface column", "drive column blank", "VM list filter broken")
+
+2. **Query `kubevirt-ui-mcp` memory tools first** (faster than Jira API):
+   - Call `search_tickets` with relevant keywords — returns cached CNV tickets with key, summary, status, type, fix version
+   - If a match is found, call `get_ticket` for full details including linked kubevirt-plugin commits
+
+3. **Fallback — Query Jira API directly** (if `kubevirt-ui-mcp` has no results or is unavailable):
+
+   ```bash
+   JQL='project = CNV AND component IN ("CNV User Interface", "CNV User Experience") AND type IN (Bug, Story) AND text ~ "<keywords>" ORDER BY updated DESC'
+
+   curl -s "https://redhat.atlassian.net/rest/api/3/search/jql?jql=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$JQL'))")&fields=key,summary,status,issuetype,priority,fixVersions&maxResults=15" | python3 -c "
+   import sys, json
+   data = json.load(sys.stdin)
+   for issue in data.get('issues', []):
+       f = issue['fields']
+       fv = ', '.join([v['name'] for v in f.get('fixVersions', [])]) or 'None'
+       print(f'{issue[\"key\"]}: [{f[\"issuetype\"][\"name\"]}] [{f[\"status\"][\"name\"]}] [{fv}] {f[\"summary\"][:120]}')
+   "
+   ```
+
+4. **For each matching ticket**, check its GitHub PR if available:
+   - `get_ticket` from `kubevirt-ui-mcp` already includes linked commits — use these to find the PR
+   - If still needed, read the Jira comments for PR links (`github.com/kubevirt-ui/kubevirt-plugin/pull/NNNN`)
+   - If a PR exists, fetch its summary via `WebFetch` to understand the fix scope
+
+5. **Classify the match**:
+
+   | Match type | Meaning |
+   |-----------|---------|
+   | **Exact match** | A Jira ticket describes the same issue — link it |
+   | **Related** | A ticket covers a similar area but not the exact issue — note as related |
+   | **Fixed but not deployed** | A ticket + merged PR exists but the fix isn't on this cluster build — note as "fix pending deployment" |
+   | **No match** | No existing ticket found — this is a **new finding** |
+
+---
+
+### Phase 5: Bug Hunt Report
+
+Produce the final report:
+
+```markdown
+# Bug Hunt Report: <Module>
+
+## Summary
+- **Module explored:** <module>
+- **Workflows replayed:** <count>
+- **Issues found:** <count>
+- **Already reported in Jira:** <count>
+- **New findings (no existing ticket):** <count>
+- **Fixed but not deployed:** <count>
+
+## Issues Found
+
+### Issue #1: <Title>
+| Field | Value |
+|-------|-------|
+| Category | Functional / Visual / Data / Error / UX |
+| Severity | Critical / Major / Minor / Cosmetic |
+| Workflow | #X — <name> |
+| Page | <URL> |
+| Expected | <expected behavior> |
+| Actual | <actual behavior> |
+| Jira Match | CNV-XXXXX (Exact / Related / None) |
+| Jira Status | ON_QA / Verified / Closed / None |
+| GitHub PR | kubevirt-plugin#NNNN (merged / open / none) |
+| Fix Deployed | Yes / No / Unknown |
+
+**Evidence:** screenshot, console errors, network trace
+
+### Issue #2: ...
+
+## New Findings (No Existing Jira Ticket)
+
+Issues that appear to have no matching Jira ticket — candidates for new bug reports:
+
+| # | Title | Category | Severity | Suggested Jira Summary |
+|---|-------|----------|----------|----------------------|
+| 1 | <title> | <cat> | <sev> | <proposed summary for filing> |
+
+## Already Reported Issues
+
+Issues that match existing Jira tickets:
+
+| # | Title | Jira | Status | Fix Version | PR |
+|---|-------|------|--------|-------------|-----|
+| 1 | <title> | CNV-XXXXX | ON_QA | v4.22.0 | #NNNN |
+
+## Recommendations
+
+1. **File new bugs:** <list of new findings worth filing>
+2. **Verify fixes:** <list of ON_QA tickets that can be verified on a newer build>
+3. **Test gaps:** <workflows that revealed no page object coverage — need new tests>
+```
+
+---
+
+## CRUD + API-Level Coverage (PRIMARY DIRECTIVE)
+
+For every module explored, full CRUD operations are a **primary directive** — not optional. Every workflow replay must include all CRUD paths and capture the corresponding network requests:
+
+| Operation | What to replay | Network check |
+|-----------|---------------|---------------|
+| **Create** | Complete the create form/wizard end-to-end | `playwright-cli request <n>` — verify `POST`/`PUT` URL, status code (201/200), request body schema |
+| **Read** | Load list view + detail page | Verify `GET` requests return the expected shape; flag 4xx/5xx or empty payloads |
+| **Update** | Edit a resource (inline edit, modal, YAML editor) | Verify `PATCH`/`PUT` endpoint, changed fields, response code (200/202) |
+| **Delete** | Delete a resource (single + bulk where available) | Verify `DELETE` endpoint pattern, confirm 200/202/204; check resource disappears from list |
+
+#### Capturing network traffic inline with workflow replay
+
+After each CRUD action, immediately inspect network traffic before moving on:
+```bash
+playwright-cli requests            # list all requests since page load
+playwright-cli request <n>         # inspect the relevant request — headers, body, response
+playwright-cli console error       # catch any JS errors triggered by the operation
+```
+
+Document each CRUD endpoint in the issue or Interaction Plan entry:
+```
+CRUD Endpoint (Create): POST /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines → 201
+CRUD Endpoint (Delete): DELETE /apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name} → 200
+```
+
+Any CRUD path where the network request returns an unexpected status code, empty payload, or the UI does not reflect the API response is itself a **bug finding** and must be documented as a Phase 3 issue with the full network evidence.
+
+API gaps: if a CRUD operation has UI test coverage but no matching test in `playwright/tests/api/`, note it in the Recommendations section as a candidate for `/api-cross-check`.
+
+---
+
+## Rules
+
+- **Read-only** — this agent does NOT modify code, create branches, or commit
+- **Match Playwright viewport** — resize to 1920×1080 at the start of the session (`playwright-cli resize 1920 1080`). This ensures screenshots and element visibility match actual test conditions.
+- **Load auth state first** — run `playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json` before navigating. Do not log in manually unless the saved state is missing or expired.
+- **Start tracing immediately** — run `playwright-cli tracing-start` right after session setup. This captures the full session evidence without needing to reproduce issues separately.
+- **Virtualization view** — always verify the sidebar shows "Virtualization" before interacting
+- **Evidence-first** — every issue must have at least a screenshot + snapshot as evidence; use `video-start`/`video-stop` for complex reproduction sequences
+- **Don't fix** — report issues, don't try to fix the application or the tests
+- **Distinguish test bugs from app bugs** — if a test assertion is wrong, that's not an app bug
+- **Be thorough but targeted** — replay workflows from actual test cases, don't randomly click
+- **Console/network check** — always check for JS errors (`playwright-cli console error`) and failed API calls (`playwright-cli network`) at each step
+- **Resource creation via MCP** — if a workflow requires a resource (VM, namespace), follow the resource creation policy from `cnv-exploration.mdc` (prefer `k8sClient` methods in test code, document any ad-hoc `oc` usage during exploration)
+- **Cluster state awareness** — call `get_cluster_info` to capture cluster/CNV version for the report; some issues may be version-specific. **Fallback**: note versions from the console UI footer
+- **Artifact cleanup** — after the bug hunt report is produced, delete ALL intermediate artifacts from the session. This includes screenshots (`*.png`), log dumps (`*.log`), DOM snapshots (`*.yml`, `*.html`, `*.txt`), files in `.playwright-mcp/` and `.playwright-cli/`, and any video files not included in the report. Use `rm -f` to clean up. The final report text and any evidence files explicitly referenced in the report are the deliverables — everything else must be removed.

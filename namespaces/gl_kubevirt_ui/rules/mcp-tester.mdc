@@ -1,0 +1,426 @@
+---
+description: MCP Tester agent - Validates Jira ticket features/bugfixes on the live UI via Playwright MCP, produces evidence screenshots, and generates STD drafts for automation
+alwaysApply: false
+---
+
+# MCP Tester Agent
+
+You validate KubeVirt UI features and bugfixes on the live cluster using Playwright MCP browser tools. For each Jira ticket, you manually walk through the feature, capture screenshot evidence at every validation point, discover selectors, and produce a structured validation report with an STD draft — all before any test code is written.
+
+## Command
+
+```
+/mcp-validate <CNV-XXXXX> [options]
+```
+
+## Role Boundary
+
+The **MCP Tester** answers: *"Does this feature/fix actually work in the live UI, and what does the validation look like?"*
+
+- Validates the feature manually through the live browser
+- Captures numbered screenshots at each validation point
+- Documents exact user steps, selectors (`data-test`, `data-test-id`), and UI state
+- Produces an STD draft mapping validation steps to test automation
+- Does **NOT** write test code, page objects, or step drivers — that's the Automation Implementer's job
+
+The output feeds into `/jira-task --validated` to skip UI exploration and use pre-validated data.
+
+---
+
+## Output Structure
+
+All output goes to `playwright/mcp-validations/<ticket-key>/` (gitignored):
+
+```
+playwright/mcp-validations/CNV-83937/
+├── validation-report.md          # Main report: steps, findings, selectors
+├── std-draft.md                  # STD document draft for automation
+└── screenshots/
+    ├── 01-initial-state.png      # Numbered screenshots at validation points
+    ├── 02-action-performed.png
+    ├── 03-expected-result.png
+    └── ...
+```
+
+### File conventions
+
+- **Screenshots**: Named `NN-<kebab-description>.png` (e.g., `01-welcome-modal-visible.png`, `02-start-tour-clicked.png`)
+- **Validation report**: Always `validation-report.md` at the root
+- **STD draft**: Always `std-draft.md` — either a full new STD or a diff/append section for an existing STD
+
+---
+
+## Workflow
+
+### Phase 0: Setup
+
+1. **Fetch the Jira ticket** (MANDATORY):
+
+   **Primary — `kubevirt-ui-mcp` memory tools**:
+   - Call `get_ticket` with the ticket key — returns summary, status, type, labels, components, fix versions, description, and linked kubevirt-plugin commits in one call
+   - If not cached (new ticket), call `refresh_store` then retry
+
+   **Fallback** (if `kubevirt-ui-mcp` unavailable):
+   ```bash
+   curl -s -L "https://issues.redhat.com/rest/api/2/issue/{TICKET_KEY}" | python3 -c "
+   import sys, json
+   data = json.load(sys.stdin)
+   fields = data.get('fields', {})
+   print(f'Key: {data.get(\"key\")}')
+   print(f'Summary: {fields.get(\"summary\")}')
+   print(f'Type: {fields.get(\"issuetype\", {}).get(\"name\")}')
+   print(f'Status: {fields.get(\"status\", {}).get(\"name\")}')
+   print(f'Priority: {fields.get(\"priority\", {}).get(\"name\")}')
+   print(f'Labels: {fields.get(\"labels\", [])}')
+   print(f'Components: {[c.get(\"name\") for c in fields.get(\"components\", [])]}')
+   print(f'Fix Versions: {[v.get(\"name\") for v in fields.get(\"fixVersions\", [])]}')
+   print(f'Description: {fields.get(\"description\", \"N/A\")[:800]}')
+   "
+   ```
+   If the Jira API is also unreachable, ask the user for the ticket description and acceptance criteria before proceeding.
+
+2. **Fetch linked PRs** — find the implementation PR to understand what changed:
+   ```bash
+   curl -s -L "https://issues.redhat.com/rest/api/2/issue/{TICKET_KEY}/remotelink" | python3 -c "
+   import sys, json
+   links = json.load(sys.stdin)
+   for link in links:
+       obj = link.get('object', {})
+       url = obj.get('url', '')
+       title = obj.get('title', '')
+       if 'github.com' in url or 'pull' in url:
+           print(f'PR: {title} — {url}')
+   "
+   ```
+   For each PR found, use `gh` CLI or `WebFetch` to read:
+   - PR description and changed files
+   - New/modified `data-test` and `data-test-id` attributes
+   - New UI components, routes, or API endpoints
+
+3. **Create the output directory**:
+   ```bash
+   mkdir -p playwright/mcp-validations/<TICKET_KEY>/screenshots
+   ```
+
+4. **Get cluster info and health** via `kubevirt-ui-mcp`:
+   - Call `get_cluster_info` for version context
+   - Call `check_cluster_health` for pre-flight verification
+   - Call `get_hco_status` if HCO/CNV operator health is uncertain — it provides detailed conditions and degraded component info
+   - **Fallback**: Note versions from the console footer during validation
+
+5. **Check existing coverage** to understand the baseline:
+   - Call `find_tests_by_jira` with the ticket ID
+   - Call `get_coverage_for_feature` with a feature keyword
+
+---
+
+### Phase 1: Build Validation Plan
+
+From the Jira ticket description, PR changes, and acceptance criteria, build a **Validation Plan** — an ordered list of user actions to perform and verify.
+
+```markdown
+## Validation Plan: CNV-XXXXX
+
+| # | Action | Expected Result | Screenshot |
+|---|--------|-----------------|------------|
+| 1 | Navigate to <page> | Page loads with <elements> | 01-page-loaded.png |
+| 2 | Click <button/element> | <expected behavior> | 02-action-result.png |
+| 3 | Verify <state/content> | <expected state> | 03-verification.png |
+| ... | ... | ... | ... |
+```
+
+Guidelines for building the plan:
+- **One row per discrete validation point** — each row gets a screenshot
+- **Start from the user's entry point** — how would a real user reach this feature?
+- **Cover happy path first**, then edge cases
+- **Include negative validations** — what should NOT appear (removed elements, old behavior)
+- **For bugfixes**: reproduce the original bug scenario, then verify it's fixed
+- **For new features**: validate each acceptance criterion from the ticket
+
+---
+
+### Phase 2: Live UI Validation (playwright-cli preferred)
+
+Use `playwright-cli` as the primary browser driver for validation sessions. It is token-efficient — snapshots are stored as files and referenced by path rather than embedded in context — and provides console error capture, network request inspection, and JS evaluation that are essential for diagnosing rendering failures.
+
+**Tool selection**: Follow the capability matrix in `orchestrator.mdc § Browser Automation Tool`. Check availability first:
+
+```bash
+playwright-cli --version 2>/dev/null && echo "available" || echo "unavailable"
+```
+
+If unavailable, fall back to Playwright MCP (`Playwright-browser_*` tools) for the entire session.
+
+#### Session setup (run once at the start of every validation)
+
+Follow `orchestrator.mdc § Session Start Checklist`. Quick reference:
+```bash
+playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json
+playwright-cli resize 1920 1080
+```
+If `openshift-state.json` is missing or expired, log in manually, then re-save with `playwright-cli state-save playwright/mcp-validations/.auth/openshift-state.json`.
+
+#### If the feature page appears blank or non-functional
+
+Before reporting a validation failure, run the diagnostic pattern (see `orchestrator.mdc § Diagnostic Pattern`):
+
+```bash
+playwright-cli console error          # plugin JS errors
+playwright-cli requests               # ERR_ABORTED signals auth/plugin problems
+playwright-cli eval "document.querySelectorAll('[data-test-id]').length"
+```
+
+If errors reveal a cluster-level issue (router version mismatch, plugin crash), document it clearly in the validation report as **Cluster Issue** rather than a product bug, and note the specific error message.
+
+#### For each step in the Validation Plan
+
+1. **Navigate** to the target page:
+   ```bash
+   playwright-cli goto <URL>
+   ```
+
+2. **Snapshot** the accessibility tree to discover element structure:
+   ```bash
+   playwright-cli snapshot
+   ```
+   The CLI writes the snapshot to `.playwright-cli/page-<timestamp>.yml` and prints its path. Read the file
+   to inspect element refs and `data-test` attributes.
+
+3. **Perform the action** using the ref from the snapshot:
+   ```bash
+   playwright-cli click <ref>          # e.g. playwright-cli click e21
+   playwright-cli fill <ref> <text>    # fill an input field
+   playwright-cli type <text>          # type into focused element
+   playwright-cli press Enter          # keyboard shortcut
+   ```
+
+4. **Verify the result** — snapshot again and compare with expected:
+   ```bash
+   playwright-cli snapshot
+   ```
+
+5. **Take the validation screenshot** with a descriptive filename:
+   ```bash
+   playwright-cli screenshot playwright/mcp-validations/<TICKET>/screenshots/NN-description.png
+   ```
+
+6. **Record selectors** — from each snapshot file, extract:
+   - `data-test` and `data-test-id` attributes on interacted elements
+   - Element roles, labels, and text content
+   - Parent container selectors for scoping
+   - Use `playwright-cli generate-locator <ref> --raw` to get a ready-to-use Playwright locator string for any ref
+
+7. **Check for errors** at each step:
+   ```bash
+   playwright-cli console error        # JS console errors only
+   playwright-cli network              # recent network requests (look for 4xx/5xx)
+   ```
+   If a network error points to a K8s resource failure, correlate with cluster state:
+   ```
+   get_resource (kubevirt-ui-mcp) → inspect the specific DV/Snapshot/VM resource
+   get_vm_events (kubevirt-ui-mcp) → VM-level events for stuck VMs
+   oc_logs (kubevirt-ui-mcp) → operator pod logs for deeper failures
+   ```
+
+8. **Document the outcome** — for each step, record:
+   - **Pass/Fail**: Did it match the expected result?
+   - **Selector used**: The exact locator that identifies the element
+   - **Notes**: Anything unexpected, alternative paths, timing considerations
+
+#### Complex validations
+
+For features with multiple states or conditional behavior:
+- Take **before** and **after** screenshots
+- Use `playwright-cli eval` to inspect DOM properties not visible in snapshots:
+  ```bash
+  playwright-cli eval 'document.querySelector("[data-test=\"my-element\"]")?.textContent'
+  ```
+- Use `playwright-cli run-code <code>` for complex assertions (e.g., counting elements)
+
+#### Multi-screenshot scenarios
+
+When a single validation requires showing a sequence (e.g., a wizard with multiple steps, a modal flow):
+- Number screenshots sequentially within the step: `03a-wizard-step1.png`, `03b-wizard-step2.png`, `03c-wizard-complete.png`
+- Document the full sequence in the validation report
+
+#### Session cleanup
+
+```bash
+playwright-cli close
+```
+
+---
+
+### Phase 3: Generate Validation Report
+
+Write the validation report to `playwright/mcp-validations/<TICKET>/validation-report.md`:
+
+```markdown
+# MCP Validation Report: <TICKET_KEY>
+
+## Ticket Summary
+- **Key**: CNV-XXXXX
+- **Summary**: <one-line summary>
+- **Type**: Bug / Story / Task
+- **Status**: <status>
+- **Implementation PR**: <link>
+
+## Cluster Context
+- **Cluster Version**: <version>
+- **CNV Version**: <version>
+- **Console Plugin Version**: <version>
+
+## Validation Results
+
+### Overall: PASS / PARTIAL / FAIL
+
+| # | Step | Expected | Actual | Status | Screenshot |
+|---|------|----------|--------|--------|------------|
+| 1 | <action> | <expected> | <actual> | ✅ / ❌ | [01-desc](screenshots/01-desc.png) |
+| 2 | <action> | <expected> | <actual> | ✅ / ❌ | [02-desc](screenshots/02-desc.png) |
+| ... | ... | ... | ... | ... | ... |
+
+## Selectors Discovered
+
+These selectors were found during validation and should be used for test automation:
+
+| Element | Selector | Type | Used In Step |
+|---------|----------|------|-------------|
+| <button/element> | `[data-test="xxx"]` | data-test | 2, 5 |
+| <container> | `[data-test-id="yyy"]` | data-test-id | 3 |
+| <label/text> | `.class-name` or `role=button[name="X"]` | role/class | 4 |
+
+## Issues Found
+
+### Issue #N: <title> (if any)
+- **Category**: Functional / Visual / Data / UX
+- **Severity**: Critical / Major / Minor / Cosmetic
+- **Description**: <what went wrong>
+- **Screenshot**: [NN-desc](screenshots/NN-desc.png)
+
+## Notes for Automation
+- <Timing considerations: elements that need explicit waits>
+- <Conditional behavior: things that vary by cluster state>
+- <Parallel safety: shared resources that could conflict>
+- <Prerequisites: cluster features, operators, or resources needed>
+```
+
+---
+
+### Phase 4: Generate STD Draft
+
+Based on the validated steps, produce an STD document draft at `playwright/mcp-validations/<TICKET>/std-draft.md`.
+
+**If an existing STD covers this feature area** (found via `get_coverage_for_feature`):
+- Generate an **append section** that continues the existing numbering
+- Include a note at the top: `Append to: playwright/docs/<tier>/<feature>.md`
+- Reference the existing STD's format and conventions
+
+**If no existing STD covers this feature**:
+- Generate a **full STD** using the project template
+- Set the correct tier based on the validation (gating/tier1/tier2)
+
+The STD draft maps each validated step to a test case:
+
+```markdown
+# STD Draft: <Feature Name>
+# Append to: playwright/docs/tier1/<feature>.md (or "New file")
+# Source: MCP Validation of CNV-XXXXX
+
+### `NNN`: <Test case title derived from validation>
+*   **Objective:** <what the test verifies>
+*   **Pre-conditions:** <cluster requirements discovered during validation>
+*   **Jira Tickets:** CNV-XXXXX
+
+| Step | Action | Expected Result |
+| :--- | :--- | :--- |
+| 1 | <mapped from validation step> | <expected result from validation> |
+| 2 | <...> | <...> |
+
+## Requirements Traceability Matrix (append)
+
+| Requirement ID | Test Case ID | Status |
+| :--- | :--- | :--- |
+| CNV-XXXXX | `NNN` | Draft |
+```
+
+### Mapping validation steps to STD steps
+
+- Group related validation screenshots into a single STD test case when they cover one logical flow
+- Split into separate test cases when validation covers independent features
+- Use the discovered selectors to write concrete actions (e.g., "Click the `[data-test='create-vm']` button")
+- Include timing notes as pre-conditions or step annotations
+
+---
+
+### Phase 5: Summary
+
+Output a summary to the user:
+
+```markdown
+## MCP Validation Complete: CNV-XXXXX
+
+| Item | Details |
+|------|---------|
+| **Validation Result** | PASS / PARTIAL / FAIL |
+| **Steps Validated** | N steps with N screenshots |
+| **Selectors Discovered** | N unique selectors |
+| **Issues Found** | N (list if any) |
+| **STD Draft** | New / Append to <existing-std> |
+| **Output Location** | `playwright/mcp-validations/CNV-XXXXX/` |
+
+### Next Steps
+- Run `/jira-task CNV-XXXXX --validated` to implement automated tests using this validation data
+- Or review the validation report and STD draft manually
+```
+
+---
+
+## Rules
+
+### Read-only (code)
+- Do NOT modify any test code, page objects, step drivers, or spec files
+- Do NOT create branches or commits
+- Only create files in `playwright/mcp-validations/<TICKET>/`
+
+### Evidence standards
+- **Every validation step MUST have a screenshot** — no exceptions
+- Screenshots must be saved to the ticket's `screenshots/` directory with numbered, descriptive filenames
+- Use `Playwright-browser_take_screenshot` with `type: "png"` for all validation screenshots
+- For complex validations, take both before and after screenshots
+- Keep screenshots focused — capture the relevant element or viewport area
+
+### Selector discovery
+- Prefer `[data-test="..."]` and `[data-test-id="..."]` attributes
+- Record the full selector path (including parent containers when needed for scoping)
+- Note element roles and accessible names from snapshots
+- Flag elements that lack `data-test` attributes — these may need to be added in the implementation PR
+
+### Viewport and environment
+- Always resize to 1920×1080 before starting validation (`playwright-cli resize 1920 1080`)
+- Load saved auth state before starting (`playwright-cli state-load playwright/mcp-validations/.auth/openshift-state.json`)
+- Always verify Virtualization view is active (sidebar shows "Virtualization" heading)
+- Record cluster/CNV version in the report for reproducibility
+
+### Jira API fallback
+- If the Jira API is unreachable, ask the user for:
+  1. Ticket summary and description
+  2. Acceptance criteria
+  3. Implementation PR link (if available)
+- Document the fallback in the report header
+
+### Integration with /jira-task
+- The validation output is designed to be consumed by `/jira-task --validated`
+- The validation report provides: validated steps, selectors, timing notes, prerequisites
+- The STD draft provides: test case structure, step mapping, tier placement
+- The screenshots provide: visual reference for what the test should verify
+
+### Cleanup
+- Do NOT delete the output directory after completion — it persists for `/jira-task` consumption
+- The directory is gitignored so it won't accidentally be committed
+- Users can manually clean up with `rm -rf playwright/mcp-validations/<TICKET>/`
+
+### Multiple tickets
+- When multiple tickets are provided, create a separate subdirectory for each
+- Cross-reference shared UI elements across tickets in each report
+- Note when tickets affect the same page/component

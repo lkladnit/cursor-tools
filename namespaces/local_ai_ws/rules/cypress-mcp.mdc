@@ -1,0 +1,72 @@
+---
+description: Cypress MCP server setup and usage (Playwright-like browser tools)
+alwaysApply: false
+---
+
+# Cypress MCP
+
+Global MCP entry in `~/.cursor/mcp.json` (same pattern as Playwright):
+
+```json
+"cypress": {
+  "command": "npx",
+  "args": ["-y", "@tms-cymcp/cypress-mcp@latest"]
+}
+```
+
+Package: [`@tms-cymcp/cypress-mcp`](https://www.npmjs.com/package/@tms-cymcp/cypress-mcp) — use the **scoped** name. The unscoped `cypress-mcp` on npm is a different package (test-runner only).
+
+## Playwright parity
+
+| Playwright MCP | Cypress MCP |
+|----------------|-------------|
+| `browser_navigate` | `browser_navigate` |
+| `browser_click` | `browser_click` |
+| `browser_type` | `browser_type` |
+| `browser_snapshot` | `browser_snapshot` |
+| `browser_take_screenshot` | `browser_screenshot` |
+| `browser_tabs` | `browser_list_tabs` / `browser_switch_tab` |
+
+Cypress MCP also adds `browser_run_cypress`, `browser_generate_test`, network mocks, storage/cookies, etc.
+
+## Optional: default app URL
+
+```json
+"cypress": {
+  "command": "npx",
+  "args": [
+    "-y",
+    "@tms-cymcp/cypress-mcp@latest",
+    "--base-url",
+    "http://localhost:9000"
+  ]
+}
+```
+
+Or set `CYPRESS_BASE_URL` in the server `env` block.
+
+## Optional: wire into an existing Cypress project
+
+For running against your real `cypress.config` (not the auto temp project), add to `setupNodeEvents`:
+
+```javascript
+const { cypressMcp } = require('@tms-cymcp/cypress-mcp/plugin');
+// inside setupNodeEvents:
+cypressMcp(on, config);
+```
+
+And in `cypress/support/e2e.ts`:
+
+```typescript
+import '@tms-cymcp/cypress-mcp/support';
+```
+
+Then run `npx @tms-cymcp/cypress-mcp` from that project directory.
+
+## Jenkins CI fix loop
+
+Use `/jenkins-fix-cycle-cy` with a Jenkins `testReport/api/json` URL to fetch `.cy.ts` failures and run this fix cycle (mirror of `/jenkins-fix-cycle-pw` for Playwright).
+
+## Test execution loop (separate package)
+
+For “run spec → read failures → rerun” without browser tools, see [`cypress-mcp`](https://www.npmjs.com/package/cypress-mcp) (jams4code) with `--cwd /path/to/project`.

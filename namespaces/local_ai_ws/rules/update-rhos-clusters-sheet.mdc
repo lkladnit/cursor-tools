@@ -1,0 +1,56 @@
+---
+description: /update-rhos-clusters-sheet — refresh the RHOS cluster info spreadsheet from live cluster data
+alwaysApply: false
+---
+
+# /update-rhos-clusters-sheet
+
+Spreadsheet ID: `1BC_xl3lQity6M2IS71c1v6C1-AxErdMEOCTUT4544Uk`, sheet: `cluster info`
+
+## Steps
+
+### 1. Generate fresh cluster data
+Run `clstr_full_info` in a shell. It writes `~/clstr_full_info_YY-MM-DD_HH-MM-SS.csv`.
+Read the CSV file it prints (skip the header row). Each row:
+```
+name, kubeadmin password, Console URL, API URL, OCP, CNV, MTC/MTV, OC Login Command
+```
+
+### 2. Read the current spreadsheet
+Read `cluster info!A1:L30` to get all rows. Identify cluster rows (non-empty column A, not the header).
+Track each cluster row's **1-based row number** and **0-based row index** (row number − 1).
+
+### 3. Diff: new vs. gone
+- **Live clusters**: names from the CSV (`uit-*` only)
+- **Sheet clusters**: names from column A that start with `uit-`
+- **New** = in CSV but not in sheet
+- **Gone** = in sheet but not in CSV
+
+### 4. Cross out gone clusters
+For each gone cluster, call `format_rows` with `strikethrough: true` on its **0-based row index**.
+Do not delete or change cell values.
+
+### 5. Insert new clusters
+For each new cluster, determine its **version group** from the cluster name prefix (e.g. `uit-420-*` → group `420`).
+
+Find the correct insertion point:
+- Locate the last row of its version group (same prefix), sorted alphabetically within the group.
+- If the version group doesn't exist yet, insert after the nearest lower version group's last row + 1 empty separator row.
+
+Insert the new row with:
+- Column A: `=HYPERLINK("<Console URL>","<cluster name>")`
+- Column B: kubeadmin password
+- Column C: Console URL
+- Column D: API URL
+- Column H: OCP value (e.g. `OCP-4.20.23`)
+- Column I: CNV value (e.g. `CNV-v4.20.15.rhel9-38`)
+- Column J: MTC/MTV value if present (e.g. `MTV-2.11.7/MTC-1.8.14`)
+- Column L: OC Login Command
+
+Use `batch_update_cells` to insert (shift existing rows down if needed by rewriting from that row onward).
+
+### 6. Report
+Print a summary:
+- ✓ N clusters unchanged
+- + added: list of new cluster names
+- ✗ crossed out: list of gone cluster names

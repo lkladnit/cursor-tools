@@ -1,0 +1,97 @@
+{
+  "namespaces": {
+    "gl_kubevirt_ui": {
+      "remote": "git@gitlab.cee.redhat.com:cnv-qe/kubevirt-ui.git",
+      "local_dirs": [
+        "~/dev/kubevirt-ui",
+        "~/dev/kubevirt-ui-cursor",
+        "~/dev/kubevirt-ui-pw"
+      ],
+      "canonical_dir": "~/dev/kubevirt-ui",
+      "scope": "deployable",
+      "tools": ["rules", "commands", "skills"]
+    },
+    "gl_cnv": {
+      "remote": "git@gitlab.cee.redhat.com:contra/cnv.git",
+      "local_dirs": ["~/dev/cnv"],
+      "canonical_dir": "~/dev/cnv",
+      "scope": "deployable",
+      "tools": ["skills"]
+    },
+    "gh_kubevirt_plugin": {
+      "remote": "https://github.com/kubevirt-ui/kubevirt-plugin.git",
+      "local_dirs": ["~/dev/kubevirt-plugin"],
+      "canonical_dir": "~/dev/kubevirt-plugin",
+      "scope": "deployable",
+      "tools": ["rules", "commands"],
+      "project_only_rules": ["project-context.mdc"]
+    },
+    "gh_ninja_agents": {
+      "remote": "https://github.com/ninja-agents/ninja-agents.git",
+      "local_dirs": ["~/dev/ninja-agents"],
+      "canonical_dir": "~/dev/ninja-agents",
+      "scope": "deployable",
+      "tools": ["rules"],
+      "project_only_rules": ["ninja-agents.mdc"]
+    },
+    "gh_networking_console": {
+      "remote": "https://github.com/openshift/networking-console-plugin",
+      "local_dirs": ["~/dev/networking-console-plugin"],
+      "canonical_dir": "~/dev/networking-console-plugin",
+      "scope": "project-only",
+      "tools": ["rules"],
+      "note": "All rules are alwaysApply:true project context — never deploy globally"
+    },
+    "gh_nmstate_console": {
+      "remote": "https://github.com/openshift/nmstate-console-plugin",
+      "local_dirs": ["~/dev/nmstate-console-plugin"],
+      "canonical_dir": "~/dev/nmstate-console-plugin",
+      "scope": "project-only",
+      "tools": ["rules"],
+      "note": "All rules are alwaysApply:true project context — never deploy globally"
+    },
+    "local_ai_ws": {
+      "remote": null,
+      "local_dirs": ["~/dev/ai"],
+      "canonical_dir": "~/dev/ai",
+      "scope": "deployable",
+      "tools": ["rules", "commands"],
+      "note": "Workspace-level .cursor/ for ~/dev/ai — conventions for cypress, playwright, TS, google-sheets"
+    },
+    "cursor_meta": {
+      "remote": null,
+      "local_dirs": ["~/.cursor"],
+      "canonical_dir": "~/.cursor",
+      "scope": "deployable",
+      "tools": ["rules", "skills-cursor", "skills"],
+      "note": "User-managed global tools — karpathy-guidelines, skills-cursor meta-skills"
+    }
+  },
+  "external_repos": {
+    "kubevirt-ui-mcp": {
+      "repo": "https://github.com/bmaio-redhat/kubevirt-ui-mcp.git",
+      "local_dir": "~/dev/kubevirt-ui-mcp",
+      "build_cmd": "source \"$HOME/.cargo/env\" && cargo build --release",
+      "build_check": "target/release/kubevirt-ui-mcp",
+      "note": "Unified MCP server for kubevirt-ui — coverage, context, CI triage, cluster ops"
+    }
+  },
+  "env_vars": {
+    "KUBEVIRT_UI_MCP_DIR": {
+      "value": "$HOME/dev/kubevirt-ui-mcp",
+      "comment": "kubevirt-ui MCP server — path to cloned repo"
+    },
+    "KUBEVIRT_PROJECT_ROOT": {
+      "value": "$HOME/dev/kubevirt-ui",
+      "comment": "kubevirt-ui MCP server — path to kubevirt-ui project root"
+    }
+  },
+  "deploy": {
+    "rules_dest": "~/.cursor/rules",
+    "commands_dest": "~/.cursor/commands",
+    "skills_dest": "~/.cursor/skills",
+    "skills_cursor_dest": "~/.cursor/skills-cursor",
+    "prefix_separator": "--",
+    "universal_rules_no_prefix": ["karpathy-guidelines.mdc"]
+  }
+}

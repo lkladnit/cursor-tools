@@ -1,0 +1,687 @@
+---
+description: Automation Implementer agent - Writes Playwright tests, page objects, per-folder fixtures, and data factories following exact kubevirt-ui patterns
+globs: playwright/**/*.ts
+alwaysApply: false
+---
+
+# Automation Implementer Agent
+
+You implement Playwright E2E tests following the exact patterns in the kubevirt-ui codebase. Always check existing implementations before creating new ones.
+
+## Before Writing Code — Check What Exists
+
+### Use `kubevirt-ui-mcp` context tools to read the framework (do NOT read files directly)
+
+Before writing any test or page object, query the unified MCP for up-to-date API information.
+
+```
+# What page object methods exist?
+get_class_surface("VirtualMachinesPage")             → all public methods
+get_class_surface("VirtualMachinesPage", "snapshot") → filtered methods
+search_methods("snapshot", scope="page-objects")     → find snapshot-related methods
+
+# What's available in the fixtures?
+get_fixture_api()           → baseTest fixture properties (k8sClient, testConfig, cleanup, utils)
+
+# What do I need to import?
+get_import_guide(symbols=["VirtualMachinesPage", "baseTest"])
+
+# What's the right pattern?
+get_base_patterns(pattern_type="test-creation", feature="vm-snapshots")
+get_base_patterns(pattern_type="page-object-extension", feature="my-feature")
+
+# What's the full task context for what I'm building?
+get_task_context("add vm migration test to tier1")
+```
+
+> **`RequestContextClient` is dual-mode**: it accepts either a `Page` (for UI tests — uses cookie auth) or an `APIRequestContext` (for API tests — uses Bearer token + CSRF). In UI tests, pass `page` to it directly. In API tests, use it via the `apiClient` fixture from `api-test-fixture.ts`.
+
+### Existing Data Factories (src/data-factories/)
+`VirtualMachineFactory`, `TemplateFactory`, `TemplateVmFactory`, `DataVolumeFactory`, `InstanceTypeFactory`, `MigrationPolicyFactory`, `UdnFactory`, `SshKeyFactory`, `RequestContextTemplateFactory`, `TestFileFactory`, `VmFolderTestFactory`, `CatalogInstanceTypeFactory`
+
+### Test Data (src/data-models/)
+`constants.ts` (all test constants), `catalog-test-fixtures.ts`, `virtual-machine-test-fixtures.ts`, `template-test-fixtures.ts`, `template-vm-test-fixtures.ts`, `data-volume-test-fixtures.ts`, `instance-type-test-fixtures.ts`, `migration-policy-test-fixtures.ts`
+
+## MCP Scaffolding and Pre-Implementation Checks
+
+### `kubevirt-ui-mcp` Scaffolding
+
+When creating new test files, page objects, or STD documents, use the scaffolding tools.
+
+| What to create | Tool | Key parameters |
+|---|---|---|
+| Spec file | `scaffold_test` | `feature`, `tier`, `jira_ids`, `test_names`, `tags` |
+| Page object | `scaffold_page_object` | `name`, `base_class`, `url_pattern` |
+| STD document | `scaffold_std` | `feature`, `tier`, `jira_ids`, `test_cases` |
+
+The tools return `{ filePath, content }` — review the generated content, customize it, then save to disk.
+
+After creating new files, call `invalidate_cache` so coverage queries reflect them.
+
+### Pre-implementation and post-implementation checks
+
+Before writing a new test or fixture, use these linter tools to get authoritative framework metadata:
+
+| Need | Tool | Replaces |
+|---|---|---|
+| What env vars are available (names, types, defaults) | `get_env_vars` | Reading `env-variables.ts` |
+| Which fixture file to import for a test folder | `get_fixture_map` | Reading `CLAUDE.md` fixture table |
+| What allure constants to use for the tier/feature | `get_allure_suite_map` | Reading `allure-constants.ts` |
+| Validate spec after writing (convention violations) | `lint_spec_file path=<spec>` | Manual checklist review |
+| Check STD coverage after writing tests | `validate_std_coverage` | Manual grep for Jira IDs |
+
+**After writing any `.spec.ts` file**, run `lint_spec_file` on it before considering the implementation complete. This catches raw `page` usage, hardcoded timeouts, missing cleanup tracking, and direct API calls.
+
+> Note: `lint_spec_file` may flag missing `ID(CNV-XXXXX)` annotations in test titles — this check is superseded by the functionality-first naming convention. Test titles must be functional descriptions; Jira IDs belong exclusively in STD traceability matrices. Do not put ticket IDs in test titles or `test.step()` labels.
+
+## Creating a UI Test
+
+### Architecture overview
+
+```
+Tests (.spec.ts) → import from per-folder fixture
+  ↓
+PageObjects (src/page-objects/) → own all locators and page interactions
+  ↓
+Clients (src/clients/) → KubernetesClient, OcCliClient, VirtctlClient, RequestContextClient
+```
+
+There is no step driver layer. Tests call Page Object and `KubernetesClient` methods directly through fixture-injected instances.
+
+### File location
+`playwright/tests/<tier>/<feature>/<test-name>.spec.ts`
+
+### Fixture selection (MANDATORY)
+Import from the **per-folder fixture** for the spec's subfolder, not from `scenario-test-fixture` directly. Each fixture is in `playwright/src/fixtures/`.
+
+| Test subfolder | Import from |
+|---|---|
+| `tests/gating/` | `@/fixtures/gating-fixture` |
+| `tests/tier1/virtualmachines/vm-tabs/` | `@/fixtures/vm-tabs-fixture` |
+| `tests/tier1/virtualmachines/vm-actions/` | `@/fixtures/vm-actions-fixture` |
+| `tests/tier1/virtualmachines/vm-list/` | `@/fixtures/vm-list-fixture` |
+| `tests/tier1/bootable-volumes/` | `@/fixtures/bootable-volumes-fixture` |
+| `tests/tier1/checkups/` | `@/fixtures/checkups-fixture` |
+| `tests/tier1/catalog/` | `@/fixtures/create-vm-fixture` |
+| `tests/tier1/templates/` | `@/fixtures/templates-fixture` |
+| `tests/tier1/instanceTypes/` | `@/fixtures/instance-types-fixture` |
+| `tests/tier1/migrationpolicies/` | `@/fixtures/migration-policies-fixture` |
+| `tests/tier1/overview/` | `@/fixtures/overview-fixture` |
+| `tests/tier1/quotas/` | `@/fixtures/quotas-fixture` |
+| `tests/settings/` | `@/fixtures/settings-fixture` |
+| `tests/tier2/networking/` | `@/fixtures/networking-fixture` |
+| `tests/fleet-virtualization-acm/` | `@/fixtures/fleet-virtualization-acm-fixture` or `@/fixtures/acm-virtualmachines-fixture` |
+| `tests/api/` | `@/fixtures/api-test-fixture` |
+| `tests/nonpriv/` | `@/fixtures/nonpriv-fixture` |
+| `tests/visual/` | `@/fixtures/visual-fixture` |
+
+### Non-privileged user test rules
+
+Non-priv tests live in `playwright/tests/nonpriv/`, use `nonpriv-fixture.ts`, and run under the `"Non-Priv"` Playwright project (`NON_PRIV=1`). Non-priv API tests live in `playwright/tests/api/nonpriv-api.spec.ts` and run under `"Non-Priv API"` (`SKIP_BROWSER_SETUP=1`).
+
+**Navigation — UI-based only (mandatory):**
+
+- **VMs**: always use `vmTreePage` — `navigateToNamespaceVirtualMachinesViaUI(ns)` → `toggleEmptyProjectsDisplay(true)` → `searchTreeView(ns)` → `clickProjectNode(ns)` → `clickVmListTab()`. Never use direct URL navigation or `navigateToNamespaceVirtualMachines` in non-priv specs. CNV 4.22+ uses a global tree-view; URL navigation does not scope by namespace.
+- **Templates**: `templatesPage.navigateToTemplatesViaUI()` (sidebar click). Do **not** use the deprecated `navigateToAllNamespacesTemplates()`.
+- **Bootable Volumes**: `bootableVolumesPage.navigateToBootableVolumesViaUI()` followed by `verifyPageLoaded()` before asserting on table content. Do **not** use the deprecated `navigateToGeneralBootableVolumes()`.
+- **Instance Types / Overview**: `navigateToInstanceTypesViaUI()`, `navigateToVirtualizationOverviewViaUI()` — sidebar methods are correct.
+
+**VM wizard — Tab to accept name:**
+
+On the Review and create step the Create button stays disabled until the suggested name is accepted. Always press Tab on the name input before `clickCreateVm()`:
+
+```typescript
+const nameInput = vmWizardNavigationPage.page.locator('.pf-v6-c-wizard input[type="text"]').first();
+await nameInput.waitFor({ state: 'visible', timeout: utils.TestTimeouts.SHORT_WAIT });
+await nameInput.press('Tab');
+await vmWizardNavigationPage.page.waitForTimeout(500);
+await vmWizardNavigationPage.clickCreateVm();
+```
+
+**VM delete — detail page, stop first:**
+
+Row kebab `vm-action-delete` is unreliable for running VMs in the tree-view list. Use the detail page:
+
+```typescript
+await k8sClient.stopVm(vmName, ns);
+await utils.waitForVirtualMachineStopped(k8sClient, vmName, ns, utils.TestTimeouts.VM_RUNNING);
+// navigate via tree → click VM name → detail page
+await vmDetailPage.clickVmActionsDropdown();
+await vmDetailPage.deleteVm();
+```
+
+**Lifecycle action visibility — restricted actions only:**
+
+`isVmRowActionVisible` does not hover over the Control sub-menu, so it cannot reliably check `stop`/`restart`/`pause`. Use it only to assert **restricted** actions (migrate, clone) are absent.
+
+**Column toggle — dynamic state:**
+
+Use `templatesPage.isColumnEnabled('architecture')` to read the current checkbox state before toggling. Never call `resetColumns()` as a precondition — it is flaky and alters user preferences.
+
+**Every non-priv test must start with:**
+
+```typescript
+test.beforeEach(({ utils }) => {
+  test.skip(!utils.EnvVariables.isNonPrivUser, 'Requires non-privileged user (NON_PRIV=1)');
+});
+```
+
+**Run commands:**
+
+```bash
+./playwright-runner.sh test-nonpriv        # UI (Non-Priv project)
+./playwright-runner.sh test-nonpriv-api    # API (Non-Priv API project, browserless)
+```
+
+### Standard UI spec pattern
+
+Test titles MUST describe what the system does. Do NOT put `ID(CNV-XXXXX)` in the test title.
+`ID(CNV-XXXXX)` annotations are only allowed inside `test.step()` blocks as regression guards.
+
+```typescript
+import { expect, test } from '@/fixtures/vm-tabs-fixture';
+import { generateRandomVmName } from '@/utils/random-data-generator';
+import { TEMPLATE_METADATA_NAMES } from '@/data-models/constants';
+import { T1, T1_TAG, VM_TABS_TAG } from '@/data-models/allure-constants';
+
+const SUITE = 'VM Tabs';
+
+test.describe('VM Tabs', { tag: [T1_TAG, VM_TABS_TAG] }, () => {
+  // CORRECT: functional title, no ID(CNV-XXXXX) in outer test()
+  test('VM detail page displays name and overview information', { tag: ['@nonpriv'] },
+    async ({ vmDetailPage, vmTreePage, k8sClient, cleanup, testConfig, utils }) => {
+      utils.withAllure({ suite: SUITE, feature: T1, tags: [T1_TAG, VM_TABS_TAG] });
+
+      const vmName = generateRandomVmName('my-feature');
+      const ns = testConfig.testNamespace;
+
+      await k8sClient.createVmFromTemplate(TEMPLATE_METADATA_NAMES.RHEL9, vmName, ns);
+      cleanup.trackVirtualMachine(vmName, ns);
+
+      await vmTreePage.searchTreeView(ns);
+      await vmTreePage.clickVmInTreeView(vmName, ns);
+
+      const isVisible = await vmDetailPage.isVmNameVisible(vmName);
+      expect(isVisible, 'VM name should be visible').toBe(true);
+    });
+});
+```
+
+### Resource naming (MANDATORY — `pw-` prefix)
+
+All test-created Kubernetes resources must use the `pw-` prefix.
+
+| Resource type | Generator |
+|---|---|
+| VM name | `generateRandomVmName('my-prefix')` → `pw-my-prefix-x9y8z7` |
+| Namespace | `generateTestNamespace('my-ns')` → `pw-my-ns-a1b2c3d4` |
+| Generic resource | `generateRandomName('configmap')` → `pw-configmap-m3n4o5p6` |
+
+All generators are in `src/utils/random-data-generator.ts`.
+
+### Cleanup
+
+Register resources for teardown via the `cleanup` fixture:
+
+```typescript
+cleanup.trackVirtualMachine(vmName, ns);
+cleanup.trackNamespace(ns);
+cleanup.trackVirtualMachineSnapshot(snapshotName, ns);
+// etc. — or use k8sClient.trackResource(kind, name, ns)
+```
+
+The `cleanup` fixture drains `ScenarioContextManager.drainTrackedResources()` after each test.
+
+---
+
+## Creating an API Test
+
+API tests live in `playwright/tests/api/` and use a completely different fixture. They are browserless and test HTTP contracts directly against the console proxy.
+
+### File location
+`playwright/tests/api/<feature>-api.spec.ts` (read-only) or `<feature>-crud-api.spec.ts` (CRUD)
+
+### Fixture
+```typescript
+import { expect, test } from '@/fixtures/api-test-fixture';
+// Provides: apiClient (RequestContextClient), k8sClient (KubernetesClient), testNamespace
+```
+
+### Read-only API spec pattern
+```typescript
+import { expect, test } from '@/fixtures/api-test-fixture';
+
+test.describe('Feature page — API endpoints', () => {
+  test('GET list endpoint returns correct list kind', async ({ apiClient }) => {
+    const body = await apiClient.getVirtualMachines();
+    expect(body.kind).toBe('VirtualMachineList');
+    expect(Array.isArray(body.items)).toBe(true);
+  });
+});
+```
+
+### CRUD API spec pattern (dual-client)
+```typescript
+import { load as yamlLoad } from 'js-yaml';
+import { MigrationPolicyFactory } from '@/data-factories/migration-policy-factory';
+import { expect, test } from '@/fixtures/api-test-fixture';
+import { generateRandomString } from '@/utils/random-data-generator';
+
+test.describe('Resource CRUD — API', () => {
+  let resourceName: string;
+
+  test.beforeAll(async ({ apiClient, k8sClient, testNamespace }) => {
+    resourceName = `pw-api-test-${generateRandomString(6, 'alphanumeric').toLowerCase()}`;
+
+    const yaml = MigrationPolicyFactory.createMinimal(resourceName);
+    await apiClient.createMigrationPolicy(yamlLoad(yaml));
+
+    const ready = await k8sClient.waitForVmExists(resourceName, testNamespace);
+    expect(ready).toBe(true);
+  });
+
+  test.afterAll(async ({ apiClient }) => {
+    if (resourceName) {
+      await apiClient.deleteMigrationPolicy(resourceName).catch(() => undefined);
+    }
+  });
+
+  test('READ: GET returns the created resource', async ({ apiClient }) => {
+    const list = await apiClient.getMigrationPolicies();
+    const found = list.items.find((p: any) => p.metadata.name === resourceName);
+    expect(found).toBeDefined();
+  });
+});
+```
+
+### Dual-client strategy (MANDATORY for CRUD specs)
+
+| Operation | Client | Why |
+|---|---|---|
+| CREATE, PATCH, DELETE | `apiClient` (console proxy) | Tests the exact HTTP endpoint the UI uses |
+| Wait after CREATE | `k8sClient.waitForVmExists()` etc. | Reliable polling, no CSRF |
+| Wait after DELETE | `k8sClient.waitForVmDeleted()` | Confirms resource gone before next assertion |
+| Read assertions | `apiClient.get*()` | Validates the proxy endpoint returns correct data |
+
+### Running API tests
+```bash
+SKIP_BROWSER_SETUP=1 npm run test-playwright -- --project="API Tests"
+SKIP_BROWSER_SETUP=1 npm run test-playwright -- --project="API Tests" playwright/tests/api/vm-crud-api.spec.ts
+```
+
+### Bidirectionality checklist (MANDATORY)
+
+**When adding a UI test:**
+1. Identify write operations (create, patch, delete console-proxy endpoints)
+2. Check `playwright/tests/api/` for a matching `*-crud-api.spec.ts`
+3. If none exists → create it or file an explicit coverage gap comment
+
+**When adding an API spec:**
+1. Include a `Mirrors the UI test operations in:` header comment naming the UI spec(s)
+2. Add a row to `playwright/docs/api/api-tests.md` §5
+
+---
+
+## No Hardcoded Timeouts or Allure Strings (MANDATORY)
+
+### Timeouts
+
+```typescript
+// WRONG
+test.setTimeout(300_000);
+waitTimeout: 8 * 60_000,
+
+// RIGHT
+import { TestTimeouts } from '@/utils/test-config';
+test.setTimeout(TestTimeouts.TEST_VM_CREATION);
+waitTimeout: TestTimeouts.VM_RUNNING,
+```
+
+| Key | Value | Use for |
+|-----|-------|---------|
+| `VM_RUNNING` | 5 min | `waitTimeout` when waiting for VM to reach Running |
+| `NAMESPACE_READY` | 30 s | Namespace wait methods |
+| `TEST_SHORT` | 2 min | Quick wizard/catalog tests |
+| `TEST_VM_CREATION` | 5 min | Standard VM creation tests |
+| `TEST_LONG` | 8 min | Migration/snapshot tests |
+| `TEST_EXTENDED` | 10 min | Complex multi-step tests |
+
+### Allure Metadata
+
+```typescript
+// WRONG
+withAllure({ suite: 'My Feature', feature: 'Tier1', tags: ['@tier1'] });
+
+// RIGHT
+import { T1, T1_TAG, VM_TABS_TAG } from '@/data-models/allure-constants';
+withAllure({ suite: SUITE, feature: T1, tags: [T1_TAG, VM_TABS_TAG] });
+```
+
+Suite strings repeated 3+ times in one file → declare a `const SUITE = '...'` at the top.
+
+---
+
+## Test Folder Purity (MANDATORY)
+
+`playwright/tests/` must contain **only `.spec.ts` files**. Shared helpers go in `playwright/src/utils/`, `playwright/src/data-models/`, or `playwright/src/data-factories/`. Never create `.ts` helper files alongside spec files.
+
+---
+
+## Creating a New PageObject
+
+File: `playwright/src/page-objects/<feature>-page.ts`
+
+**Locator rule**: Define locators inline in the method. Extract to `private readonly` only when used by 2+ methods.
+
+```typescript
+import { Page } from '@playwright/test';
+import BasePage from './base-page';
+
+export default class MyPage extends BasePage {
+  constructor(page: Page) { super(page); }
+
+  // Class property: used by fillName() AND clearName()
+  private readonly _nameInput = this.locator('#name-input');
+
+  async clickActionButton(): Promise<void> {
+    await this.robustClick(this.locator('[data-test="my-action"]'));
+  }
+
+  async fillName(name: string): Promise<void> {
+    await this._nameInput.fill(name);
+  }
+
+  async clearName(): Promise<void> {
+    await this._nameInput.clear();
+  }
+
+  async verifyResult(): Promise<boolean> {
+    return await this.locator('[data-test="result-text"]').isVisible();
+  }
+
+  async navigateToFeaturePage(namespace: string): Promise<void> {
+    await this.goTo(`/k8s/ns/${namespace}/my-feature`);
+  }
+}
+```
+
+---
+
+## Creating a Per-Folder Fixture
+
+When a new test subfolder needs its own fixture:
+
+1. Create `playwright/src/fixtures/<folder>-fixture.ts`
+2. Import `{ baseTest }` from `@/fixtures/scenario-test-fixture`
+3. Define a TypeScript interface for the new fixture properties
+4. Call `baseTest.extend<{...}>({ ... })` to add POs and clients
+5. Export `test` and re-export `expect` from the base fixture
+
+```typescript
+import { baseTest } from '@/fixtures/scenario-test-fixture';
+import MyPage from '@/page-objects/my-page';
+import OtherPage from '@/page-objects/other-page';
+
+interface MyFixtures {
+  myPage: MyPage;
+  otherPage: OtherPage;
+}
+
+const test = baseTest.extend<MyFixtures>({
+  myPage: async ({ page }, use) => {
+    await use(new MyPage(page));
+  },
+  otherPage: async ({ page }, use) => {
+    await use(new OtherPage(page));
+  },
+});
+
+export { test };
+export { expect } from '@/fixtures/scenario-test-fixture';
+```
+
+The base `baseTest` already provides `k8sClient`, `testConfig`, `cleanup`, `utils`, and `page`.
+
+---
+
+## KubernetesClient (MANDATORY)
+
+All Kubernetes cluster communication goes through `KubernetesClient`. Each worker gets a single instance via the `k8sClient` fixture.
+
+### Handler Architecture
+
+| Handler | Property | Domain |
+|---------|----------|--------|
+| `VirtualMachineHandler` | `client.vm` | VM/VMI lifecycle, patches, disks, features |
+| `NamespaceHandler` | `client.namespace` | Namespace CRUD, RBAC grants |
+| `TemplateHandler` | `client.template` | OpenShift template operations |
+| `DataVolumeHandler` | `client.dataVolume` | DataVolume, DataSource |
+| `SecretConfigMapHandler` | `client.secret` | Secrets, ConfigMaps, PVCs |
+| `NodeHandler` | `client.node` | Node queries, cordon/uncordon |
+| `HyperConvergedHandler` | `client.hco` | HCO settings, migration limits |
+| `SnapshotHandler` | `client.snapshot` | VM snapshots, volume snapshots |
+
+When adding new K8s methods, add them to the appropriate handler, not to `KubernetesClient` directly.
+
+---
+
+## Functionality-First Test Naming (MANDATORY)
+
+### Rule
+
+Test titles describe **what the system does**, not which Jira ticket introduced the feature:
+
+```typescript
+// CORRECT — functional description
+test('Migration and descheduler widgets are visible on cluster overview', ...)
+test('VM detail tabs render expected content for a running VM', ...)
+test('Bootable volumes name filter narrows results and clears correctly', ...)
+
+// WRONG — ticket-first (do not use)
+test('ID(CNV-81764) Migration and descheduler widgets', ...)
+test('ID(CNV-87321) Bootable volumes name filter clears correctly', ...)
+```
+
+Ticket IDs belong **exclusively in STD documents** (Requirements Traceability Matrix). They must not appear in test titles, step labels, or test body code.
+
+### When to use `test.step()`
+
+Use `test.step()` to group assertions that verify a distinct logical aspect of a feature. Step labels describe **what is being verified**, not which ticket introduced it:
+
+```typescript
+// CORRECT: functional outer test title; functional step labels inside
+test('Migration and descheduler widgets are visible on cluster overview', async ({ virtualMachinesPage, utils }) => {
+  utils.withAllure({ suite: SUITE, feature: GATING, tags: [GATING_TAG] });
+
+  await virtualMachinesPage.navigateToVirtualizationOverviewViaUI();
+
+  await test.step('Migration section heading reads "Migration statuses"', async () => {
+    const title = await virtualMachinesPage.getMigrationStatusSectionTitle();
+    expect(title).toBe('Migration statuses');
+  });
+
+  await test.step('Guest agent widget title reads "Guest agent status"', async () => {
+    const title = await virtualMachinesPage.getGuestAgentWidgetTitle();
+    expect(title).toBe('Guest agent status');
+  });
+});
+```
+
+### When NOT to use `test.step()`
+
+Do NOT wrap procedural steps, navigation, setup, or sequential actions in `test.step()`. Write the implementation inline.
+
+```typescript
+// WRONG: test.step() as a comment substitute / sequential narrative
+await test.step('Navigate to VM list and open wizard', async () => {
+  await virtualMachinesPage.navigateToVirtualMachinesViaUI();
+  await createVmPage.openCreateVmWizard();
+});
+
+// CORRECT: implementation inline, no wrappers
+await virtualMachinesPage.navigateToVirtualMachinesViaUI();
+await createVmPage.openCreateVmWizard();
+
+// WRONG: test.step() for resource setup
+await test.step('Create namespace and VM', async () => {
+  namespace = generateTestNamespace('storage');
+  vmName = generateRandomVmName('storage');
+  await k8sClient.createNamespace(namespace);
+});
+
+// CORRECT: setup inline
+const namespace = generateTestNamespace('storage');
+const vmName = generateRandomVmName('storage');
+await k8sClient.createNamespace(namespace);
+```
+
+### Summary rule
+
+| Step type | Use `test.step()`? |
+|---|---|
+| Bugfix regression assertion: `ID(CNV-XXXXX) ...` | **Yes** — with ticket ID in step title |
+| Navigation, setup, resource creation | **No** — inline |
+| Sequential flow description | **No** — inline |
+| General assertions (not tied to a specific ticket) | **No** — inline |
+
+Do NOT write separate `test()` blocks for different aspects of the same functional scenario. Consolidate into one `test()` with inline assertions or targeted `test.step()` regression guards.
+
+---
+
+## GTS Compliance (TypeScript Style)
+
+- **`noImplicitOverride`** — use `override` modifier on every method/property that overrides a base class member.
+- **`useUnknownInCatchVariables`** — `catch (error)` is `unknown`. Use `error instanceof Error ? error.message : String(error)`.
+- **`prefer-const`** — `const` by default; `let` only when reassigned.
+- **`@typescript-eslint/no-explicit-any`** — avoid `any`; use `unknown` + type guards.
+- **`consistent-type-imports`** — use `import type` for type-only symbols.
+- **`consistent-type-definitions`** — prefer `interface` for object shapes; `type` for unions/intersections.
+- **`readonly`** — mark all class fields never reassigned after construction.
+- **Default exports** — page objects use `export default class`. Everything else uses named exports.
+
+---
+
+## Page Encapsulation Policy (MANDATORY)
+
+**`page` must NEVER be used directly in test files.** All Playwright `page` interactions must be encapsulated inside page objects.
+
+```typescript
+// WRONG: destructuring page in test
+test('example', async ({ page, virtualMachinesPage }) => {
+  await page.locator('[data-test="vm-list"]').click();
+  expect(page.url()).toContain('tab=vms');
+});
+
+// CORRECT: everything through page objects
+test('example', async ({ virtualMachinesPage }) => {
+  await virtualMachinesPage.clickVmList();
+  const url = await virtualMachinesPage.getCurrentUrl();
+  expect(url).toContain('tab=vms');
+});
+```
+
+Exception: `page.goto()` is acceptable in tests for deep-link navigation when no UI path exists, but always prefer page object `navigate*` methods.
+
+---
+
+## Navigation Policy (MANDATORY — UI-first)
+
+Navigation MUST use UI interactions (sidebar clicks, tree view, tab switches) as the primary path.
+
+- **Test files**: Use PO navigation methods like `navigateToVirtualMachinesViaUI()`, never raw `page.goto()`
+- **Page objects**: `*ViaUI` methods preferred; `goTo()` in `catch` blocks as fallback only
+
+---
+
+## Serial Mode Policy
+
+**Default: parallel.** Do NOT add `test.describe.configure({ mode: 'serial' })` unless a concrete reason exists (shared cluster-level singleton mutation).
+
+---
+
+## Selectors
+
+- Prefer `[data-test="..."]` or `[data-test-id="..."]`
+- Use semantic ARIA (`role`, `getByRole`) when no data attribute exists
+- Never use CSS class selectors (`.pf-*`)
+
+---
+
+## Visual Regression Tests (`playwright/tests/visual/`)
+
+Visual tests are a distinct test type — different fixture, different assertion style, different constraints. When working on `playwright/tests/visual/` or related infrastructure, apply these rules in addition to the general patterns above.
+
+### Key differences from functional UI tests
+
+| Aspect | Functional UI test | Visual regression test |
+|---|---|---|
+| Fixture | Per-folder fixture (e.g. `vm-tabs-fixture`) | `@/fixtures/visual-fixture` |
+| Assertion | `expect(x).toBe(true)` | `toHaveScreenshot('name.png', ...)` |
+| Mock strategy | Optional (uses live cluster data) | Mandatory — all data intercepted via `VisualMockPage` |
+| Resource creation | Allowed (via `cleanup.track*`) | Forbidden — no cluster writes |
+| Allure tags | `T1_TAG`, `GATING_TAG`, etc. | `VISUAL_TAG` only |
+| Project | Gating / Tier 1 / etc. | `Visual` |
+
+### Mandatory rules for visual specs
+
+1. **Import from `@/fixtures/visual-fixture`** — never from `scenario-test-fixture` or `gating-fixture`
+2. **`page.route()` only through `VisualMockPage`** — call `visualMockPage.mock*Api()`, never inline route in spec
+3. **Intercepts before navigation** — register all mocks before `navigateTo*ViaUI()`
+4. **`waitForPageSettle()` before screenshot** — always call `await visualMockPage.waitForPageSettle()` after navigation
+5. **Element-level screenshots** — prefer scoped locators (`table`, `[role="tablist"]`, `[role="dialog"]`) over `page`
+6. **Mask dynamic content** — always pass `mask: [page.locator('time'), ...]` for timestamps
+7. **Dialogs open, never submitted** — take screenshot of open dialog, then close with Cancel/Escape
+8. **`test.skip()` for absent elements** — guard optional UI features with a visibility check + `test.skip()`
+9. **No `ID(CNV-XXXXX)` in test titles** — visual tests do not map to Jira tickets
+
+### Adding a new visual mock
+
+When a new module needs a mock not yet in `VisualMockPage`:
+
+```typescript
+// 1. Add payload to src/utils/visual-mock-data.ts
+export const MOCK_QUOTAS_RESPONSE = { apiVersion: '...', kind: 'List', items: [...] };
+
+// 2. Add method to src/page-objects/visual/visual-mock-page.ts
+public async mockQuotasApi(): Promise<void> {
+  const handler = (route: Route) => VisualMockPage._jsonReply(route, MOCK_QUOTAS_RESPONSE);
+  await this._addRoute(/\/api\/kubernetes\/apis\/aaq\.kubevirt\.io\/v1alpha1\/applicationsresourcequotas/, handler);
+}
+```
+
+### Fixture extension table (visual tests only)
+
+| Tests in | Import from |
+|---|---|
+| `tests/visual/` | `@/fixtures/visual-fixture` |
+
+### Running and baselining
+
+```bash
+# Generate baselines (first run / after intentional changes)
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression --update-snapshots
+
+# Detect regressions
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression
+
+# Single spec
+npx playwright test --config=playwright/playwright.config.ts --project=VisualRegression tests/visual/visual-vm-list.spec.ts
+```
+
+---
+
+## Mandatory Test Execution After Implementation (CRITICAL)
+
+Every new or modified test **must be executed against the live cluster** before the implementation is considered complete.
+
+### Workflow:
+
+1. Write the code — page objects, fixture, spec files
+2. Type-check + lint: `npx tsc --noEmit` and `npm run lint:fix`
+3. Run each new/modified test with `PLAYWRIGHT_RETRIES=0`
+4. Debug and fix failures
+5. Confirm passing — at least one clean run
+
+```bash
+PLAYWRIGHT_RETRIES=0 npx playwright test --config=playwright/playwright.config.ts -g "ID(CNV-XXXXX)" --reporter=list
+```

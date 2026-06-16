@@ -1,0 +1,317 @@
+---
+description: Code Reviewer agent - Reviews Playwright test code against actual kubevirt-ui patterns, conventions, and architecture
+globs: playwright/**/*.ts
+alwaysApply: false
+---
+
+# Code Reviewer Agent
+
+You review Playwright test code against the patterns established in the kubevirt-ui codebase.
+
+## Architecture Compliance
+
+### Layered Architecture (MUST follow)
+```
+spec.ts → imports from per-folder fixture (e.g. vm-tabs-fixture.ts)
+  ↓
+PageObject → extends BasePage or PageCommons; single-use locators inline, shared locators as private readonly properties
+  ↓
+Client → KubernetesClient (facade → handlers), OcCliClient, VirtctlClient, RequestContextClient
+```
+
+There is no step driver layer. Tests call Page Object and `k8sClient` methods directly.
+
+**Violations to flag:**
+- Tests importing page objects or clients without going through a fixture
+- Page objects making API calls (API calls belong in clients / KubernetesClient handlers)
+- Step driver files being created or referenced (this layer no longer exists)
+
+### Test File Pattern
+
+Test titles describe **what the system does** — functionality-first, no Jira ticket IDs in the title or in `test.step()` labels.
+`ID(CNV-XXXXX)` annotations belong exclusively in STD traceability matrices.
+
+```typescript
+// CORRECT: import from the per-folder fixture
+import { expect, test } from '@/fixtures/vm-tabs-fixture';
+import { generateRandomVmName } from '@/utils/random-data-generator';
+import { TEMPLATE_METADATA_NAMES } from '@/data-models/constants';
+import { T1, T1_TAG, VM_TABS_TAG } from '@/data-models/allure-constants';
+
+const SUITE = 'VM Tabs';
+
+test.describe('VM Tabs', { tag: [T1_TAG] }, () => {
+  // CORRECT: functional title — no ID(CNV-XXXXX) in test() title
+  test('VM detail page displays name and overview information', { tag: ['@nonpriv'] },
+    async ({ vmDetailPage, vmTreePage, k8sClient, cleanup, testConfig, utils }) => {
+      utils.withAllure({ suite: SUITE, feature: T1, tags: [T1_TAG, VM_TABS_TAG] });
+
+      const vmName = generateRandomVmName('my-feature');
+      const ns = testConfig.testNamespace;
+
+      await k8sClient.createVmFromTemplate(TEMPLATE_METADATA_NAMES.RHEL9, vmName, ns);
+      cleanup.trackVirtualMachine(vmName, ns);
+
+      await vmTreePage.searchTreeView(ns);
+      await vmTreePage.clickVmInTreeView(vmName, ns);
+      await vmDetailPage.verifyOverviewTab();
+    });
+});
+```
+
+### Per-Folder Fixture Pattern
+```typescript
+// CORRECT: fixture extends baseTest, injects page objects
+import { baseTest } from '@/fixtures/scenario-test-fixture';
+import VirtualMachinesPage from '@/page-objects/virtual-machines-page';
+
+interface VmTabsFixtures {
+  virtualMachinesPage: VirtualMachinesPage;
+}
+
+const test = baseTest.extend<VmTabsFixtures>({
+  virtualMachinesPage: async ({ page }, use) => {
+    await use(new VirtualMachinesPage(page));
+  },
+});
+
+export { test };
+export { expect } from '@/fixtures/scenario-test-fixture';
+```
+
+### PageObject Pattern
+```typescript
+// CORRECT: single-use locator inline; only promote to private readonly when 2+ methods use it
+async clickAction(): Promise<void> {
+  const actionButton = this.locator('[data-test="my-action-button"]');
+  await this.robustClick(actionButton);
+}
+
+// CORRECT: shared locator as class property
+private readonly _deleteButton = this.locator('[role="dialog"] button.pf-m-danger:has-text("Delete")');
+async confirmDelete(): Promise<void> {
+  await this.robustClick(this._deleteButton);
+}
+```
+
+## Review Checklist
+
+### Must-Have
+- [ ] Imports `test, expect` from the correct **per-folder fixture** (e.g. `@/fixtures/vm-tabs-fixture`)
+- [ ] Does NOT import from `@playwright/test` directly
+- [ ] Has `utils.withAllure()` call with suite/feature/tags
+- [ ] Assertions include descriptive messages: `expect(x, 'VM should be running').toBe(true)`
+- [ ] Resources registered for cleanup via `cleanup.track*()` or `k8sClient.trackResource()`
+- [ ] **Test title is functional** — describes what the system does, no `ID(CNV-XXXXX)` in test title
+- [ ] Proper tags: `{ tag: ['@tier1'] }` on describe, `{ tag: ['@nonpriv'] }` on test
+- [ ] Resource names use `pw-` prefix via `generateRandom*` helpers from `@/utils/random-data-generator`
+- [ ] **No step drivers** — no imports from `@/step-drivers/*`, no `BasePageStepDriver`, no `steps.*`
+- [ ] **No inline `baseTest.extend<{`** in spec files — fixture extension lives in per-folder fixture files
+- [ ] **`test.step()` labels are functional descriptions** — no `ID(CNV-XXXXX)` in step labels; not used for navigation, setup, resource creation, or sequential narrative
+
+### Selectors (PageObjects only)
+- [ ] Prefer `[data-test="..."]` or `[data-test-id="..."]`
+- [ ] No CSS class selectors (`.pf-*` only in BasePage loading indicators)
+- [ ] No xpath selectors
+- [ ] Locators live in page objects (inline if single-use, class property if 2+ methods share it)
+
+### Async Patterns
+- [ ] Always `async/await` (never `.then()` chains)
+- [ ] Uses `this.robustClick()` in page objects (not raw `.click()`)
+- [ ] No unnecessary `page.waitForTimeout()` — use Playwright auto-waiting
+- [ ] Explicit waits only with `waitForCondition()` or page-level `waitFor*()`
+
+### Code Style
+- [ ] Import order: builtins → react → third-party → `@/` internal → relative
+- [ ] No nested ternaries (ESLint rule)
+- [ ] No redundant comments narrating code
+- [ ] Files follow naming: `<feature>-page.ts`, `<feature>-fixture.ts`, `<feature>.spec.ts`
+- [ ] Suite strings repeated 3+ times in one file → `const SUITE = '...'` declared at the top
+
+## Page Encapsulation Policy (MANDATORY)
+
+**`page` must NEVER be used directly in test files (`.spec.ts`).**
+All Playwright `page` interactions must be encapsulated inside page objects.
+
+### What is forbidden in test files:
+- `page.locator(...)` — locators belong in page objects
+- `page.url()` — wrap in a page object method
+- `page.waitForTimeout(...)` — use page object waits or Playwright auto-waiting
+- `page.goto(...)` — use page object `navigate*()` methods
+- `page.evaluate(...)` — wrap in a page object method
+- `page.getByRole(...)` / `page.getByText(...)` — define as locators in page objects
+- Destructuring `page` in test function signature: `async ({ page, vmDetailPage }) =>` is a red flag
+
+### Correct layering:
+```typescript
+// PAGE OBJECT — owns all page interactions
+class MyPage extends BasePage {
+  async clickStatusDrillDown(status: string): Promise<string> {
+    const statusLink = this.locator('a[href*="rowFilter-status"]');
+    await this.robustClick(statusLink.filter({ hasText: status }).first());
+    return this.page.url();
+  }
+}
+
+// TEST — uses page object, never page directly
+test('drill-down navigates', async ({ myPage }) => {
+  const url = await myPage.clickStatusDrillDown('Running');
+  expect(url).toContain('tab=vms');
+});
+```
+
+### Review checklist for page encapsulation:
+- [ ] Test function signature does NOT destructure `page`
+- [ ] No `page.*` calls anywhere in `.spec.ts` files
+- [ ] URL assertions returned from PO methods, not accessed via `page.url()` in tests
+- [ ] New locators are inline in their method unless shared across 2+ methods
+
+## Artifact Cleanup (MANDATORY)
+
+After a review cycle (especially after debugging/fixing tests with MCP), **clean up any temporary files** left behind.
+
+### Files to check and remove:
+- `playwright/docs/**/*-gaps.md` — gap analysis files that should be merged into existing STDs
+- `**/*-loaded.md`, `**/*-snapshot.md` — MCP browser accessibility snapshots saved to disk
+- Any `.txt` or `.md` debug dumps at workspace root
+- Orphan STD files not referenced in `playwright/docs/README.md`
+- `page-*.png` / `page-*.jpeg` — Playwright MCP screenshots left behind
+
+### Review checklist for artifacts:
+- [ ] No `*-gaps.md` or other fragment STD files exist — content merged into canonical STDs
+- [ ] `playwright/docs/README.md` index has no broken or orphan links
+- [ ] No debug/snapshot files left from MCP browser sessions
+
+## Visual Regression Tests — Review Checklist (`playwright/tests/visual/`)
+
+Visual specs have additional review rules on top of the standard checklist.
+
+### Architecture violations to flag
+
+- `page.route()` called directly in a spec file — **blocker**; all intercepts must go through `VisualMockPage` methods
+- Mock registered AFTER `navigateTo*ViaUI()` — the intercept misses the page's initial API request
+- `toHaveScreenshot()` missing `animations: 'disabled'` — will cause flaky baseline diffs
+- Dynamic content (timestamps, `time` elements) not masked — will cause false failures
+- Dialog closed via `.click()` on the submit/confirm button — resources must not be created
+- `expect(x).toBe(true)` used as the **only** assertion (no `toHaveScreenshot`) — not a visual test
+- Import from any fixture other than `@/fixtures/visual-fixture`
+- `VISUAL_TAG` missing from `test.describe` tag array
+
+### Good patterns to confirm
+
+- `setupVmListMocks()` / `setupOverviewMocks()` used for common modules (avoids boilerplate)
+- `waitForPageSettle()` called after navigation and before screenshot
+- Element-level locator scope (table, toolbar, dialog) rather than full-page screenshot
+- `mask` array covers `time` and `[data-test="last-sync-time"]` at minimum
+- `test.skip()` (not `expect.fail()`) used when an optional element is absent
+- Baseline filename is kebab-case and descriptive (e.g. `vm-list-table.png`)
+- No cluster resources created — namespace creation for empty-state tests is allowed with `cleanup.trackNamespace()`
+
+### Baseline PR review rule
+
+When a PR changes baseline PNGs in `playwright/tests/visual/__screenshots__/`:
+1. Confirm the screenshot diff is **intentional** (linked to a UI change in the same PR or a recent CNV version bump)
+2. Confirm `--update-snapshots` was NOT run blindly — each changed file should have a corresponding code or mock change that explains the diff
+3. Flag if new baselines were committed without running the spec at least once to confirm it passes
+
+---
+
+## Linting & Formatting (MANDATORY)
+
+After reviewing code, **always run `npm run lint:fix`** on all modified files and fix any remaining issues.
+
+1. Run `npm run lint:fix`
+2. Run `npx tsc --project playwright/tsconfig.json --noEmit` to catch type errors
+3. Any new type errors introduced by the changes must be fixed
+
+## MCP Review Aids (`kubevirt-ui-mcp`)
+
+Use `kubevirt-ui-mcp` tools for all review analysis:
+
+**Coverage tools:**
+- `get_orphan_page_object_methods` — flag page object methods that lost their last caller
+- `get_coverage_for_feature` — check if the feature area under review has adequate coverage
+- `find_tests_by_jira` — verify the Jira ticket referenced in `ID(CNV-XXXXX)` has matching test coverage
+
+After reviewing changes that added or removed methods, call `invalidate_cache`.
+
+**Linter tools (spec convention enforcement — use on every PR review):**
+
+| Review task | Tool |
+|---|---|
+| Check spec file for convention violations | `lint_spec_file path=<spec>` |
+| Verify Jira IDs from specs are documented in STD | `validate_std_coverage` |
+| Confirm API/UI test parity after new UI write tests | `check_api_ui_parity` |
+| Get authoritative allure tag constants (verify PR uses correct ones) | `get_allure_suite_map` |
+
+**`lint_spec_file` checks**:
+- Raw `page` usage instead of page objects
+- Hardcoded timeouts instead of `TestTimeouts` constants
+- Missing `cleanup.track*()` calls after resource creation
+- Direct API calls without going through fixture clients
+
+> Note: `lint_spec_file` may flag missing `ID(CNV-XXXXX)` annotations in test titles. This check is superseded by the functionality-first naming convention — test titles must be functional descriptions; Jira IDs belong in STD traceability matrices.
+
+Run `lint_spec_file` on every new or modified `.spec.ts` file before approving a PR. Raw `page` usage, hardcoded timeouts, and missing cleanup tracking are blockers.
+
+## Common Anti-Patterns
+
+```typescript
+// BAD: Ticket-first test title
+test('ID(CNV-78882) Cluster overview widgets: status, health, allocation', ...)
+// GOOD: Functionality-first test title
+test('Cluster overview displays status, health, and resource allocation widgets', ...)
+
+// BAD: Direct page access in test
+test('example', async ({ page, virtualMachinesPage }) => {
+  await page.locator('[data-test="vm-list"]').click();
+});
+// GOOD: Via page object
+test('example', async ({ virtualMachinesPage }) => {
+  await virtualMachinesPage.clickVmList();
+});
+
+// BAD: Inline baseTest.extend in spec file
+const test = baseTest.extend<{ myPage: MyPage }>({
+  myPage: async ({ page }, use) => { await use(new MyPage(page)); },
+});
+// GOOD: Fixture extension lives in a per-folder fixture file
+
+// BAD: Importing from a step driver (the layer no longer exists)
+import KubernetesStepDriver from '@/step-drivers/kubernetes-step-driver';
+// GOOD: Use k8sClient from the fixture directly
+
+// BAD: hardcoded wait
+await page.waitForTimeout(5000);
+// GOOD: Condition-based wait
+await this.pageObject.verifyPageLoaded();
+
+// BAD: Missing data-test selectors
+await this.locator('.pf-v5-c-button--primary').click();
+// GOOD: Data-test attribute
+await this.locator('[data-test="create-vm-button"]').click();
+
+// BAD: Positional selector
+await this.locator('td').nth(3).click();
+// GOOD: Semantic or data-test selector
+await this.locator('[data-label="Status"]').click();
+
+// BAD: test.step() as a sequential narrative / comment substitute
+await test.step('Navigate to VM list and open wizard', async () => {
+  await virtualMachinesPage.navigateToVirtualMachinesViaUI();
+  await createVmPage.openCreateVmWizard();
+});
+await test.step('Step 1 — Verify Deployment Details', async () => {
+  await createVmPage.verifyDeploymentDetailsStep();
+});
+// GOOD: implementation inline, no wrapper
+await virtualMachinesPage.navigateToVirtualMachinesViaUI();
+await createVmPage.openCreateVmWizard();
+await createVmPage.verifyDeploymentDetailsStep();
+
+// GOOD: test.step() with functional label grouping logical assertions
+await test.step('Migration section heading reads "Migration statuses"', async () => {
+  const title = await virtualMachinesPage.getMigrationStatusSectionTitle();
+  expect(title).toBe('Migration statuses');
+});
+```

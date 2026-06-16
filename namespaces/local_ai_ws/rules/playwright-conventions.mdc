@@ -1,0 +1,25 @@
+---
+description: Playwright end-to-end test conventions
+globs: **/*.spec.ts
+alwaysApply: false
+---
+
+# Playwright Conventions
+
+- Use `data-testid` attributes for selectors — never rely on CSS classes or DOM structure
+- Prefer `getByRole`, `getByText`, `getByTestId` over raw CSS selectors
+- Use `expect(locator).toBeVisible()` before interacting with elements
+- Always use `test.describe` to group related scenarios
+- Use Page Object Model for pages visited by more than one test file
+- Avoid hard-coded waits — use `waitForSelector`, `waitForResponse`, or auto-retrying assertions
+
+```typescript
+// ❌ BAD
+await page.click(".btn-primary.submit-form");
+await page.waitForTimeout(3000);
+expect(await page.$(".success-msg")).toBeTruthy();
+
+// ✅ GOOD
+await page.getByTestId("submit-button").click();
+await expect(page.getByRole("alert")).toHaveText("Saved successfully");
+```

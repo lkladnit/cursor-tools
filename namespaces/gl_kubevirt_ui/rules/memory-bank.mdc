@@ -1,0 +1,39 @@
+---
+description: Memory Bank Protocol - Cross-session knowledge graph stored in an external repository
+alwaysApply: false
+---
+
+# Memory Bank Protocol
+
+The memory bank is a persistent, cross-referenced knowledge graph maintained in a **separate repository**:
+
+**→ https://github.com/bmaio-redhat/kubevirt-memory**
+
+Do **not** store memory bank files in this repository. All agents must read from and contribute to the external repo.
+
+## How to Access
+
+- **Local path**: `/home/bmaio/Developer/Projects/kubevirt-memory`
+- **Remote**: https://github.com/bmaio-redhat/kubevirt-memory
+
+Read and write files directly at the local path. Commit and push to `main` in the external repo when contributing new nodes.
+
+## Three Checkpoints (ALL Personas)
+
+### 1. Before Work — Read
+
+At the start of a task, consult the external memory bank:
+1. Read `index.md` to see what nodes exist
+2. Read nodes relevant to the current task (features, tickets, gotchas, flaky tests)
+3. Use what you find — don't rediscover what a previous session already learned
+
+### 2. During Work — Note
+
+Track decisions, gotchas, framework changes, and coverage gaps as you work.
+
+### 3. After Work — Write and Prune
+
+Contribute findings back to the external repo:
+- Create or update nodes in the appropriate directory
+- Prune stale entries found during reads
+- Never add cluster credentials, tokens, passwords, or `.env` values
