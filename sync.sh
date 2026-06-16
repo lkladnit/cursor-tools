@@ -172,17 +172,18 @@ deploy_ns() {
   echo ""
   yellow "deploy $ns  → ~/.cursor/"
 
-  # Rules: prefix each file with ns--
+  # Rules: prefix each file with ns-- and remove any stale unprefixed duplicate
   if [[ -d "$ns_dir/rules" ]]; then
     mkdir -p "$CURSOR_RULES"
     for f in "$ns_dir/rules/"*.mdc; do
       [[ -f "$f" ]] || continue
       fname=$(basename "$f")
-      # Universal rules: no prefix
       if [[ "$fname" == "karpathy-guidelines.mdc" ]]; then
         copy_if_newer "$f" "$CURSOR_RULES/$fname" "$force"
       else
         copy_if_newer "$f" "$CURSOR_RULES/${ns}${SEP}${fname}" "$force"
+        # Remove stale unprefixed duplicate if it exists
+        [[ -f "$CURSOR_RULES/$fname" ]] && rm "$CURSOR_RULES/$fname" && echo "  removed stale unprefixed: $fname"
       fi
     done
     # Subdirs (agents/, workflows/, flat/)
@@ -192,26 +193,33 @@ deploy_ns() {
         [[ -f "$f" ]] || continue
         fname=$(basename "$f")
         copy_if_newer "$f" "$CURSOR_RULES/${ns}${SEP}${fname}" "$force"
+        [[ -f "$CURSOR_RULES/$fname" ]] && rm "$CURSOR_RULES/$fname" && echo "  removed stale unprefixed: $fname"
       done
     done
   fi
 
-  # Commands: prefix each file with ns--
+  # Commands: prefix each file with ns-- and remove any stale unprefixed duplicate
   if [[ -d "$ns_dir/commands" ]]; then
     mkdir -p "$CURSOR_COMMANDS"
     for f in "$ns_dir/commands/"*.md; do
       [[ -f "$f" ]] || continue
       fname=$(basename "$f")
       copy_if_newer "$f" "$CURSOR_COMMANDS/${ns}${SEP}${fname}" "$force"
+      [[ -f "$CURSOR_COMMANDS/$fname" ]] && rm "$CURSOR_COMMANDS/$fname" && echo "  removed stale unprefixed: $fname"
     done
   fi
 
-  # Skills: copy into ~/.cursor/skills/<ns>/
+  # Skills: copy flat as ns--skill-name/ (1 level deep — required for Cursor discovery)
+  # Universal namespaces (cursor_meta) keep the original skill name without prefix
   if [[ -d "$ns_dir/skills" ]]; then
     for skill_dir in "$ns_dir/skills/"/*/; do
       [[ -d "$skill_dir" ]] || continue
       skill_name=$(basename "$skill_dir")
-      copy_dir_if_newer "$skill_dir" "$CURSOR_SKILLS/$ns/$skill_name" "$force"
+      if [[ "$ns" == "cursor_meta" ]]; then
+        copy_dir_if_newer "$skill_dir" "$CURSOR_SKILLS/$skill_name" "$force"
+      else
+        copy_dir_if_newer "$skill_dir" "$CURSOR_SKILLS/${ns}${SEP}${skill_name}" "$force"
+      fi
     done
   fi
 
@@ -219,6 +227,9 @@ deploy_ns() {
   if [[ "$ns" == "cursor_meta" ]] && [[ -d "$ns_dir/skills-cursor" ]]; then
     copy_dir_if_newer "$ns_dir/skills-cursor" "$CURSOR_SKILLS_CURSOR" "$force"
   fi
+
+  # Remove stale ns-subdir if it exists (from old deploy layout)
+  [[ -d "$CURSOR_SKILLS/$ns" ]] && rm -rf "$CURSOR_SKILLS/$ns" && echo "  cleaned stale dir: skills/$ns"
 
   green "done: $ns"
 }
