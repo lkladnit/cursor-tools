@@ -172,19 +172,16 @@ deploy_ns() {
   echo ""
   yellow "deploy $ns  → ~/.cursor/"
 
-  # Rules: prefix each file with ns-- and remove any stale unprefixed duplicate
+  # Rules: deploy with SHORT name (no prefix) — Cursor surfaces them by filename in / menu
+  # Collisions: last namespace deployed wins (see registry.json deploy order)
   if [[ -d "$ns_dir/rules" ]]; then
     mkdir -p "$CURSOR_RULES"
     for f in "$ns_dir/rules/"*.mdc; do
       [[ -f "$f" ]] || continue
       fname=$(basename "$f")
-      if [[ "$fname" == "karpathy-guidelines.mdc" ]]; then
-        copy_if_newer "$f" "$CURSOR_RULES/$fname" "$force"
-      else
-        copy_if_newer "$f" "$CURSOR_RULES/${ns}${SEP}${fname}" "$force"
-        # Remove stale unprefixed duplicate if it exists
-        [[ -f "$CURSOR_RULES/$fname" ]] && rm "$CURSOR_RULES/$fname" && echo "  removed stale unprefixed: $fname"
-      fi
+      copy_if_newer "$f" "$CURSOR_RULES/$fname" "$force"
+      # Remove any stale prefixed version from a previous deploy
+      [[ -f "$CURSOR_RULES/${ns}${SEP}${fname}" ]] && rm "$CURSOR_RULES/${ns}${SEP}${fname}" && echo "  removed stale prefixed: ${ns}${SEP}${fname}"
     done
     # Subdirs (agents/, workflows/, flat/)
     for subdir in "$ns_dir/rules/"/*/; do
@@ -192,20 +189,22 @@ deploy_ns() {
       for f in "$subdir"*.mdc; do
         [[ -f "$f" ]] || continue
         fname=$(basename "$f")
-        copy_if_newer "$f" "$CURSOR_RULES/${ns}${SEP}${fname}" "$force"
-        [[ -f "$CURSOR_RULES/$fname" ]] && rm "$CURSOR_RULES/$fname" && echo "  removed stale unprefixed: $fname"
+        copy_if_newer "$f" "$CURSOR_RULES/$fname" "$force"
+        [[ -f "$CURSOR_RULES/${ns}${SEP}${fname}" ]] && rm "$CURSOR_RULES/${ns}${SEP}${fname}" && echo "  removed stale prefixed: ${ns}${SEP}${fname}"
       done
     done
   fi
 
-  # Commands: prefix each file with ns-- and remove any stale unprefixed duplicate
+  # Commands: deploy with SHORT name (no prefix) — humans type these via /
+  # Collisions: last namespace deployed wins (see registry.json deploy order)
   if [[ -d "$ns_dir/commands" ]]; then
     mkdir -p "$CURSOR_COMMANDS"
     for f in "$ns_dir/commands/"*.md; do
       [[ -f "$f" ]] || continue
       fname=$(basename "$f")
-      copy_if_newer "$f" "$CURSOR_COMMANDS/${ns}${SEP}${fname}" "$force"
-      [[ -f "$CURSOR_COMMANDS/$fname" ]] && rm "$CURSOR_COMMANDS/$fname" && echo "  removed stale unprefixed: $fname"
+      copy_if_newer "$f" "$CURSOR_COMMANDS/$fname" "$force"
+      # Remove any stale prefixed version that may exist from a previous deploy
+      [[ -f "$CURSOR_COMMANDS/${ns}${SEP}${fname}" ]] && rm "$CURSOR_COMMANDS/${ns}${SEP}${fname}" && echo "  removed stale prefixed: ${ns}${SEP}${fname}"
     done
   fi
 
