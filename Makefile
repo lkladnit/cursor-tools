@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 SYNC  := ./sync.sh
 
-.PHONY: help setup harvest deploy status
+.PHONY: help setup scan harvest deploy status
 
 help:
 	@echo ""
@@ -17,6 +17,12 @@ help:
 
 setup:
 	@bash ./setup.sh
+
+scan:
+	@$(SYNC) scan
+
+register:
+	@$(SYNC) scan --force
 
 harvest:
 ifdef NS

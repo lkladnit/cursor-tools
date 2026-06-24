@@ -233,6 +233,127 @@ deploy_ns() {
   green "done: $ns"
 }
 
+# ── scan ─────────────────────────────────────────────────────────────────────
+# Discover all .cursor/ dirs under ~/dev/ and report unregistered ones.
+# --register  : auto-add unregistered dirs to registry.json (scope=deployable)
+
+scan_dev() {
+  local do_register="${1:-false}"
+
+  python3 - "$SCRIPT_DIR" "$do_register" << 'PYEOF'
+import sys, os, json, subprocess, re
+from pathlib import Path
+
+SCRIPT_DIR  = Path(sys.argv[1])
+DO_REGISTER = sys.argv[2] == "true"
+REGISTRY    = SCRIPT_DIR / "registry.json"
+DEV         = Path.home() / "dev"
+
+registry = json.load(open(REGISTRY))
+known_dirs = set()
+for ns, cfg in registry["namespaces"].items():
+    for d in cfg.get("local_dirs", []):
+        known_dirs.add(str(Path(d.replace("~", str(Path.home()))).resolve()))
+
+def get_remote(path):
+    try:
+        r = subprocess.run(["git","-C",str(path),"remote","get-url","origin"],
+                           capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().replace("oauth2:"+r.stdout.split("@")[0].split("oauth2:")[1]+"@", "") \
+               if "oauth2:" in r.stdout else r.stdout.strip()
+    except Exception:
+        return ""
+
+def suggest_ns(path, remote):
+    name = Path(path).name.replace("-","_").replace(".","_")
+    if not remote:
+        return f"local_{name}"
+    if "github.com" in remote:
+        repo = re.sub(r"\.git$","", remote.split("/")[-1]).replace("-","_")
+        return f"gh_{repo}"
+    if "gitlab" in remote:
+        repo = re.sub(r"\.git$","", remote.split("/")[-1]).replace("-","_")
+        return f"gl_{repo}"
+    return f"local_{name}"
+
+def count_tools(cursor_dir):
+    p = Path(cursor_dir)
+    rules  = len(list((p/"rules").rglob("*.mdc")))  if (p/"rules").exists()    else 0
+    cmds   = len(list((p/"commands").glob("*.md")))  if (p/"commands").exists() else 0
+    skills = sum(1 for x in (p/"skills").iterdir() if x.is_dir()) \
+             if (p/"skills").exists() else 0
+    return rules, cmds, skills
+
+# Find all .cursor dirs up to depth 3
+found = []
+for depth in [1, 2]:
+    pattern = "/".join(["*"] * depth) + "/.cursor"
+    for cursor_dir in DEV.glob(pattern):
+        proj_dir = cursor_dir.parent
+        resolved = str(proj_dir.resolve())
+        rules, cmds, skills = count_tools(cursor_dir)
+        if rules + cmds + skills == 0:
+            continue  # skip empty .cursor dirs
+        remote = get_remote(proj_dir)
+        ns = suggest_ns(proj_dir, remote)
+        registered = resolved in known_dirs
+        found.append({
+            "path": str(proj_dir),
+            "resolved": resolved,
+            "remote": remote or "(no remote)",
+            "ns": ns,
+            "rules": rules, "cmds": cmds, "skills": skills,
+            "registered": registered,
+        })
+
+new_entries = {}
+
+print()
+print(f"  {'Path':<45} {'Namespace':<28} {'R':>3} {'C':>3} {'S':>3}  Status")
+print(f"  {'-'*45} {'-'*28} {'-'*3} {'-'*3} {'-'*3}  ------")
+for item in sorted(found, key=lambda x: x["path"]):
+    status = "registered" if item["registered"] else "NEW"
+    marker = "  " if item["registered"] else "→ "
+    short  = item["path"].replace(str(Path.home()), "~")
+    print(f"  {marker}{short:<43} {item['ns']:<28} {item['rules']:>3} {item['cmds']:>3} {item['skills']:>3}  {status}")
+    if not item["registered"]:
+        new_entries[item["ns"]] = item
+
+print()
+
+if not new_entries:
+    print("  All .cursor workspaces are already registered.")
+    sys.exit(0)
+
+if not DO_REGISTER:
+    print(f"  {len(new_entries)} unregistered workspace(s). Run with --register to add them.")
+    sys.exit(0)
+
+# Register new entries
+print("  Registering new namespaces...")
+for ns, item in new_entries.items():
+    rel = "~" + item["path"][len(str(Path.home())):]
+    tools = []
+    if item["rules"]:  tools.append("rules")
+    if item["cmds"]:   tools.append("commands")
+    if item["skills"]: tools.append("skills")
+    registry["namespaces"][ns] = {
+        "remote": None if item["remote"] == "(no remote)" else item["remote"],
+        "local_dirs": [rel],
+        "canonical_dir": rel,
+        "scope": "deployable",
+        "tools": tools,
+        "note": "auto-registered by scan"
+    }
+    print(f"    added: {ns}  ({rel})")
+
+with open(REGISTRY, "w") as f:
+    json.dump(registry, f, indent=2)
+print()
+print("  registry.json updated. Run 'make harvest' to pull tools.")
+PYEOF
+}
+
 # ── status ────────────────────────────────────────────────────────────────────
 
 show_status() {
@@ -304,11 +425,16 @@ case "$CMD" in
       done
     fi
     ;;
+  scan)
+    scan_dev "$FORCE"
+    ;;
   status)
     show_status
     ;;
   *)
     echo "Usage:"
+    echo "  ./sync.sh scan                             # discover unregistered .cursor/ dirs in ~/dev/"
+    echo "  ./sync.sh scan --force                     # discover + register new ones in registry.json"
     echo "  ./sync.sh harvest [--ns <ns>] [--force]   # project .cursor/ → namespaces/"
     echo "  ./sync.sh deploy  [--ns <ns>] [--force]   # namespaces/ → ~/.cursor/"
     echo "  ./sync.sh status                           # show namespace tool counts"
