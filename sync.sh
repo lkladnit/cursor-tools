@@ -233,34 +233,21 @@ deploy_ns() {
   green "done: $ns"
 }
 
-# ── scan ─────────────────────────────────────────────────────────────────────
-# Discover all .cursor/ dirs under ~/dev/ and report unregistered ones.
-# --register  : auto-add unregistered dirs to registry.json (scope=deployable)
+# ── shared helpers (Python) ───────────────────────────────────────────────────
 
-scan_dev() {
-  local do_register="${1:-false}"
-
-  python3 - "$SCRIPT_DIR" "$do_register" << 'PYEOF'
-import sys, os, json, subprocess, re
+_py_helpers='
+import subprocess, re
 from pathlib import Path
-
-SCRIPT_DIR  = Path(sys.argv[1])
-DO_REGISTER = sys.argv[2] == "true"
-REGISTRY    = SCRIPT_DIR / "registry.json"
-DEV         = Path.home() / "dev"
-
-registry = json.load(open(REGISTRY))
-known_dirs = set()
-for ns, cfg in registry["namespaces"].items():
-    for d in cfg.get("local_dirs", []):
-        known_dirs.add(str(Path(d.replace("~", str(Path.home()))).resolve()))
 
 def get_remote(path):
     try:
         r = subprocess.run(["git","-C",str(path),"remote","get-url","origin"],
                            capture_output=True, text=True, timeout=3)
-        return r.stdout.strip().replace("oauth2:"+r.stdout.split("@")[0].split("oauth2:")[1]+"@", "") \
-               if "oauth2:" in r.stdout else r.stdout.strip()
+        raw = r.stdout.strip()
+        if not raw: return ""
+        if "oauth2:" in raw:
+            raw = re.sub(r"oauth2:[^@]+@", "", raw)
+        return raw
     except Exception:
         return ""
 
@@ -269,10 +256,10 @@ def suggest_ns(path, remote):
     if not remote:
         return f"local_{name}"
     if "github.com" in remote:
-        repo = re.sub(r"\.git$","", remote.split("/")[-1]).replace("-","_")
+        repo = re.sub(r"[.]git$","", remote.split("/")[-1]).replace("-","_")
         return f"gh_{repo}"
     if "gitlab" in remote:
-        repo = re.sub(r"\.git$","", remote.split("/")[-1]).replace("-","_")
+        repo = re.sub(r"[.]git$","", remote.split("/")[-1]).replace("-","_")
         return f"gl_{repo}"
     return f"local_{name}"
 
@@ -282,43 +269,73 @@ def count_tools(cursor_dir):
     cmds   = len(list((p/"commands").glob("*.md")))  if (p/"commands").exists() else 0
     skills = sum(1 for x in (p/"skills").iterdir() if x.is_dir()) \
              if (p/"skills").exists() else 0
-    return rules, cmds, skills
+    mcp    = (p/"mcp.json").exists()
+    return rules, cmds, skills, mcp
 
-# Find all .cursor dirs up to depth 3
+def known_dirs(registry):
+    s = set()
+    for ns, cfg in registry["namespaces"].items():
+        for d in cfg.get("local_dirs", []):
+            s.add(str(Path(d.replace("~", str(Path.home()))).resolve()))
+    return s
+
+def rel_path(p):
+    return "~" + str(p)[len(str(Path.home())):]
+'
+
+# ── scan ─────────────────────────────────────────────────────────────────────
+# Scan a directory (default ~/dev/) for .cursor/ dirs and report unregistered ones.
+# Usage: ./sync.sh scan [path] [--force]
+#   path     : directory to scan (default ~/dev/)
+#   --force  : auto-register unregistered dirs in registry.json
+
+scan_dev() {
+  local scan_path="${1:-$HOME/dev}"
+  local do_register="${2:-false}"
+  scan_path=$(expandpath "$scan_path")
+
+  python3 - "$SCRIPT_DIR" "$scan_path" "$do_register" << PYEOF
+import sys, os, json
+from pathlib import Path
+exec("""$_py_helpers""")
+
+SCRIPT_DIR  = Path(sys.argv[1])
+SCAN_PATH   = Path(sys.argv[2]).expanduser()
+DO_REGISTER = sys.argv[3] == "true"
+REGISTRY    = SCRIPT_DIR / "registry.json"
+
+registry = json.load(open(REGISTRY))
+known    = known_dirs(registry)
+
 found = []
 for depth in [1, 2]:
     pattern = "/".join(["*"] * depth) + "/.cursor"
-    for cursor_dir in DEV.glob(pattern):
+    for cursor_dir in SCAN_PATH.glob(pattern):
         proj_dir = cursor_dir.parent
         resolved = str(proj_dir.resolve())
-        rules, cmds, skills = count_tools(cursor_dir)
-        if rules + cmds + skills == 0:
-            continue  # skip empty .cursor dirs
+        rules, cmds, skills, mcp = count_tools(cursor_dir)
         remote = get_remote(proj_dir)
-        ns = suggest_ns(proj_dir, remote)
-        registered = resolved in known_dirs
+        ns     = suggest_ns(proj_dir, remote)
+        tools_label = f"R={rules} C={cmds} S={skills}" + (" mcp" if mcp else "")
         found.append({
-            "path": str(proj_dir),
-            "resolved": resolved,
-            "remote": remote or "(no remote)",
-            "ns": ns,
-            "rules": rules, "cmds": cmds, "skills": skills,
-            "registered": registered,
+            "path": str(proj_dir), "resolved": resolved,
+            "remote": remote or "(no remote)", "ns": ns,
+            "rules": rules, "cmds": cmds, "skills": skills, "mcp": mcp,
+            "registered": resolved in known,
         })
 
 new_entries = {}
-
 print()
-print(f"  {'Path':<45} {'Namespace':<28} {'R':>3} {'C':>3} {'S':>3}  Status")
-print(f"  {'-'*45} {'-'*28} {'-'*3} {'-'*3} {'-'*3}  ------")
+print(f"  {'Path':<45} {'Namespace':<28} {'R':>3} {'C':>3} {'S':>3}  {'MCP':<5}  Status")
+print(f"  {'-'*45} {'-'*28} {'-'*3} {'-'*3} {'-'*3}  {'-'*5}  ------")
 for item in sorted(found, key=lambda x: x["path"]):
-    status = "registered" if item["registered"] else "NEW"
+    status = "ok" if item["registered"] else "NEW"
     marker = "  " if item["registered"] else "→ "
-    short  = item["path"].replace(str(Path.home()), "~")
-    print(f"  {marker}{short:<43} {item['ns']:<28} {item['rules']:>3} {item['cmds']:>3} {item['skills']:>3}  {status}")
+    short  = rel_path(Path(item["path"]))
+    mcp_s  = "yes" if item["mcp"] else ""
+    print(f"  {marker}{short:<43} {item['ns']:<28} {item['rules']:>3} {item['cmds']:>3} {item['skills']:>3}  {mcp_s:<5}  {status}")
     if not item["registered"]:
         new_entries[item["ns"]] = item
-
 print()
 
 if not new_entries:
@@ -326,32 +343,128 @@ if not new_entries:
     sys.exit(0)
 
 if not DO_REGISTER:
-    print(f"  {len(new_entries)} unregistered workspace(s). Run with --register to add them.")
+    print(f"  {len(new_entries)} unregistered workspace(s).")
+    print("  Run:  make register           — auto-register all")
+    print("  Run:  ./sync.sh add <path>    — register one with full control")
     sys.exit(0)
 
-# Register new entries
-print("  Registering new namespaces...")
+print("  Registering...")
 for ns, item in new_entries.items():
-    rel = "~" + item["path"][len(str(Path.home())):]
-    tools = []
-    if item["rules"]:  tools.append("rules")
-    if item["cmds"]:   tools.append("commands")
-    if item["skills"]: tools.append("skills")
+    tools = [t for t, v in [("rules",item["rules"]),("commands",item["cmds"]),("skills",item["skills"])] if v]
     registry["namespaces"][ns] = {
-        "remote": None if item["remote"] == "(no remote)" else item["remote"],
-        "local_dirs": [rel],
-        "canonical_dir": rel,
+        "remote": None if item["remote"]=="(no remote)" else item["remote"],
+        "local_dirs": [rel_path(Path(item["path"]))],
+        "canonical_dir": rel_path(Path(item["path"])),
         "scope": "deployable",
-        "tools": tools,
+        "tools": tools or ["rules","commands","skills"],
         "note": "auto-registered by scan"
     }
-    print(f"    added: {ns}  ({rel})")
-
-with open(REGISTRY, "w") as f:
+    print(f"    + {ns}  ({rel_path(Path(item['path']))})")
+with open(REGISTRY,"w") as f:
     json.dump(registry, f, indent=2)
 print()
 print("  registry.json updated. Run 'make harvest' to pull tools.")
 PYEOF
+}
+
+# ── add ───────────────────────────────────────────────────────────────────────
+# Register one project in registry.json.
+# Usage: ./sync.sh add <path> [--ns <name>] [--scope deployable|project-only]
+
+add_ns() {
+  local proj_path="$1" override_ns="$2" scope="${3:-deployable}"
+  proj_path=$(expandpath "$proj_path")
+
+  python3 - "$SCRIPT_DIR" "$proj_path" "$override_ns" "$scope" << PYEOF
+import sys, json
+from pathlib import Path
+exec("""$_py_helpers""")
+
+SCRIPT_DIR   = Path(sys.argv[1])
+PROJ         = Path(sys.argv[2]).resolve()
+OVERRIDE_NS  = sys.argv[3]
+SCOPE        = sys.argv[4]
+REGISTRY     = SCRIPT_DIR / "registry.json"
+
+if not PROJ.exists():
+    print(f"  error: path does not exist: {PROJ}")
+    sys.exit(1)
+
+registry = json.load(open(REGISTRY))
+known    = known_dirs(registry)
+
+if str(PROJ) in known:
+    # Find which ns already owns it
+    for ns, cfg in registry["namespaces"].items():
+        for d in cfg.get("local_dirs", []):
+            if str(Path(d.replace("~",str(Path.home()))).resolve()) == str(PROJ):
+                print(f"  already registered as '{ns}'")
+                sys.exit(0)
+
+remote = get_remote(PROJ)
+ns     = OVERRIDE_NS if OVERRIDE_NS else suggest_ns(PROJ, remote)
+cursor_dir = PROJ / ".cursor"
+rules, cmds, skills, mcp = count_tools(cursor_dir) if cursor_dir.exists() else (0,0,0,False)
+tools  = [t for t,v in [("rules",rules),("commands",cmds),("skills",skills)] if v]
+rel    = rel_path(PROJ)
+
+registry["namespaces"][ns] = {
+    "remote": remote if remote else None,
+    "local_dirs": [rel],
+    "canonical_dir": rel,
+    "scope": SCOPE,
+    "tools": tools or ["rules","commands","skills"],
+}
+with open(REGISTRY,"w") as f:
+    json.dump(registry, f, indent=2)
+
+print(f"  added: {ns}")
+print(f"    path:   {rel}")
+print(f"    remote: {remote or '(none)'}")
+print(f"    scope:  {SCOPE}")
+print(f"    tools:  R={rules} C={cmds} S={skills}" + (" + mcp.json" if mcp else ""))
+print()
+print(f"  Run: ./sync.sh harvest --ns {ns}")
+PYEOF
+}
+
+# ── remove ────────────────────────────────────────────────────────────────────
+# Remove a namespace from registry.json.
+# Usage: ./sync.sh remove <ns> [--clean]
+#   --clean : also delete namespaces/<ns>/ directory
+
+remove_ns() {
+  local ns="$1" clean="${2:-false}"
+
+  python3 - "$SCRIPT_DIR" "$ns" << PYEOF
+import sys, json
+from pathlib import Path
+import shutil
+
+SCRIPT_DIR = Path(sys.argv[1])
+NS         = sys.argv[2]
+REGISTRY   = SCRIPT_DIR / "registry.json"
+
+registry = json.load(open(REGISTRY))
+if NS not in registry["namespaces"]:
+    print(f"  error: namespace '{NS}' not found in registry")
+    sys.exit(1)
+
+cfg = registry["namespaces"].pop(NS)
+with open(REGISTRY,"w") as f:
+    json.dump(registry, f, indent=2)
+print(f"  removed: {NS}  ({cfg.get('canonical_dir','')})")
+PYEOF
+
+  # Optionally remove namespaces/ dir
+  if [[ -d "$NAMESPACES_DIR/$ns" ]]; then
+    if [[ "$clean" == "true" ]]; then
+      rm -rf "$NAMESPACES_DIR/$ns"
+      green "  deleted: namespaces/$ns/"
+    else
+      info "note: namespaces/$ns/ still exists (use --clean to delete)"
+    fi
+  fi
 }
 
 # ── status ────────────────────────────────────────────────────────────────────
@@ -387,13 +500,19 @@ PYEOF
 CMD="${1:-help}"
 FILTER_NS=""
 FORCE=false
+EXTRA_ARG=""
+SCOPE="deployable"
+CLEAN=false
 
 shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ns)   FILTER_NS="$2"; shift 2 ;;
+    --ns)    FILTER_NS="$2"; shift 2 ;;
     --force) FORCE=true; shift ;;
-    *)      shift ;;
+    --scope) SCOPE="$2"; shift 2 ;;
+    --clean) CLEAN=true; shift ;;
+    -*)      shift ;;
+    *)       EXTRA_ARG="$1"; shift ;;
   esac
 done
 
@@ -426,17 +545,34 @@ case "$CMD" in
     fi
     ;;
   scan)
-    scan_dev "$FORCE"
+    scan_dev "${EXTRA_ARG:-$HOME/dev}" "$FORCE"
+    ;;
+  add)
+    if [[ -z "$EXTRA_ARG" ]]; then
+      red "Usage: ./sync.sh add <path> [--ns <name>] [--scope deployable|project-only]"
+      exit 1
+    fi
+    add_ns "$EXTRA_ARG" "$FILTER_NS" "$SCOPE"
+    ;;
+  remove)
+    NS="${FILTER_NS:-$EXTRA_ARG}"
+    if [[ -z "$NS" ]]; then
+      red "Usage: ./sync.sh remove <ns>  OR  ./sync.sh remove --ns <ns> [--clean]"
+      exit 1
+    fi
+    remove_ns "$NS" "$CLEAN"
     ;;
   status)
     show_status
     ;;
   *)
     echo "Usage:"
-    echo "  ./sync.sh scan                             # discover unregistered .cursor/ dirs in ~/dev/"
-    echo "  ./sync.sh scan --force                     # discover + register new ones in registry.json"
-    echo "  ./sync.sh harvest [--ns <ns>] [--force]   # project .cursor/ → namespaces/"
-    echo "  ./sync.sh deploy  [--ns <ns>] [--force]   # namespaces/ → ~/.cursor/"
-    echo "  ./sync.sh status                           # show namespace tool counts"
+    echo "  ./sync.sh scan [path]                              # discover unregistered .cursor/ dirs (default ~/dev/)"
+    echo "  ./sync.sh scan [path] --force                      # discover + auto-register all new"
+    echo "  ./sync.sh add <path> [--ns <name>] [--scope ...]  # register one project"
+    echo "  ./sync.sh remove <ns> [--clean]                    # unregister (--clean also removes namespaces/<ns>/)"
+    echo "  ./sync.sh harvest [--ns <ns>] [--force]            # project .cursor/ → namespaces/"
+    echo "  ./sync.sh deploy  [--ns <ns>] [--force]            # namespaces/ → ~/.cursor/"
+    echo "  ./sync.sh status                                    # show namespace tool counts"
     ;;
 esac
